@@ -193,6 +193,12 @@ struct TokenDashboardContent: View {
                                         .foregroundStyle(.white.opacity(0.84))
                                 }
                                 .lineLimit(1)
+
+                                Text("* 数据均来源于tokscale。使用 LiteLLM 的定价数据获取实时定价计算，支持分级定价模型和缓存代币折扣。")
+                                    .font(.system(size: 12, weight: .regular))
+                                    .foregroundStyle(.white.opacity(0.5))
+                                    .frame(width: 320)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             .padding(.leading, 26)
                             .padding(.top, 10)
