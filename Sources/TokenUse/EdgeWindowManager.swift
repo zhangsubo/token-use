@@ -33,7 +33,7 @@ final class EdgeWindowManager: NSObject {
     private let triggerWidth: CGFloat = 43
     private let triggerHeight: CGFloat = 157
     private let panelWidth: CGFloat = 644
-    private let panelHeight: CGFloat = 718
+    private let panelHeight: CGFloat = 670
     private let panelEdgeInset: CGFloat = 78
     private let hideDelay: TimeInterval = 0.3
 
@@ -371,18 +371,18 @@ private struct TriggerCapsuleWithArrow: View {
                     LinearGradient(
                         colors: isHovered
                             ? [
-                                Color(.sRGB, red: 0.369, green: 0.525, blue: 1.0),    // #5E86FF
+                                Color(.sRGB, red: 0.369, green: 0.525, blue: 1.0),
                                 Color(.sRGB, red: 0.28, green: 0.44, blue: 0.95)
                             ]
                             : [
-                                Color(.sRGB, red: 0.369, green: 0.525, blue: 1.0),    // #5E86FF
-                                Color(.sRGB, red: 0.28, green: 0.44, blue: 0.95)
+                                Color(.sRGB, red: 0.40, green: 0.48, blue: 0.68).opacity(0.58),
+                                Color(.sRGB, red: 0.26, green: 0.34, blue: 0.54).opacity(0.50)
                             ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
-                .frame(width: isVertical ? 43 : 157, height: isVertical ? 157 : 43)
+                .frame(width: isVertical ? 34 : 136, height: isVertical ? 136 : 34)
                 .overlay(
                     Capsule()
                         .fill(
@@ -395,23 +395,21 @@ private struct TriggerCapsuleWithArrow: View {
                                 endPoint: .bottom
                             )
                         )
-                        .frame(width: isVertical ? 38 : 152, height: isVertical ? 152 : 38)
+                        .frame(width: isVertical ? 29 : 131, height: isVertical ? 131 : 29)
                 )
                 .overlay(
                     Capsule()
-                        .stroke(.white.opacity(isHovered ? 0.50 : 0.25), lineWidth: 0.6)
+                        .stroke(.white.opacity(isHovered ? 0.50 : 0.18), lineWidth: 0.6)
                 )
-                .shadow(color: .black.opacity(0.20), radius: 3, x: 0, y: 1)
-                // Outer glow — spec: 0 0 22px rgba(91,133,255,.82)
+                .shadow(color: .black.opacity(isHovered ? 0.20 : 0.12), radius: 3, x: 0, y: 1)
                 .shadow(
-                    color: Color(.sRGB, red: 0.357, green: 0.522, blue: 1.0).opacity(isHovered ? 0.82 : 0.35),
-                    radius: isHovered ? 22 : 10
+                    color: Color(.sRGB, red: 0.357, green: 0.522, blue: 1.0).opacity(isHovered ? 0.72 : 0.16),
+                    radius: isHovered ? 20 : 8
                 )
 
-            // Arrow — spec: white, ~31px
             Image(systemName: isVertical ? "chevron.left" : "chevron.down")
-                .font(.system(size: isVertical ? 31 : 28, weight: .bold))
-                .foregroundStyle(.white)
+                .font(.system(size: isVertical ? 20 : 18, weight: .bold))
+                .foregroundStyle(.white.opacity(isHovered ? 0.92 : 0.54))
         }
     }
 }
@@ -428,7 +426,7 @@ struct EdgeContentView: View {
             showsHandle: true,
             refreshAction: { Task { await appState.refresh() } }
         )
-        .frame(width: 644, height: 718)
+        .frame(width: 644, height: 670)
         .onHover { hovering in
             if hovering {
                 manager.cancelHideTimer()

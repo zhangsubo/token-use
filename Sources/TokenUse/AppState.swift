@@ -118,10 +118,15 @@ final class AppState: ObservableObject {
 
     private func startTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
+        let interval = SettingsManager.shared.refreshInterval
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.fetchData()
             }
         }
+    }
+
+    func restartTimer() {
+        startTimer()
     }
 }

@@ -17,86 +17,95 @@ struct DonutChartView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             ZStack {
-                // Background circle — spec: 274×274
                 Circle()
                     .fill(
                         LinearGradient(
                             colors: [
-                                .white.opacity(0.10),
-                                .white.opacity(0.03)
+                                .white.opacity(0.13),
+                                .white.opacity(0.035)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
-                    .frame(width: 274, height: 274)
-                    .shadow(color: .black.opacity(0.10), radius: 16, x: 0, y: 8)
+                    .frame(width: 266, height: 266)
+                    .shadow(color: .black.opacity(0.12), radius: 18, x: 0, y: 10)
                     .overlay(
                         Circle()
-                            .stroke(.white.opacity(0.18), lineWidth: 1)
+                            .stroke(.white.opacity(0.20), lineWidth: 0.8)
                     )
 
-                // Donut — spec: outer 137px, inner 83px → ratio 0.606, angularInset 2.5, cornerRadius 4
+                Circle()
+                    .fill(.black.opacity(0.055))
+                    .frame(width: 158, height: 158)
+                    .blur(radius: 1)
+
                 Chart(segments) { segment in
                     SectorMark(
                         angle: .value("Tokens", segment.value),
-                        innerRadius: .ratio(0.606),
-                        angularInset: 2.5
+                        innerRadius: .ratio(0.64),
+                        angularInset: 2.8
                     )
                     .foregroundStyle(colorMap[segment.colorName] ?? .gray)
-                    .cornerRadius(4)
+                    .cornerRadius(5)
                 }
                 .chartBackground { _ in
                     Color.clear
                 }
-                .frame(width: 250, height: 250)
-                .shadow(color: .black.opacity(0.05), radius: 3, x: 0, y: 1)
+                .frame(width: 242, height: 242)
+                .shadow(color: .black.opacity(0.08), radius: 4, x: 0, y: 2)
 
-                // Center text — spec: 40px bold + 20px regular
-                VStack(spacing: 2) {
+                VStack(spacing: 3) {
                     Text(NumberFormatterUtil.format(totalTokens))
-                        .font(.system(size: 40, weight: .bold, design: .rounded))
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.72)
                     Text("Total Tokens")
-                        .font(.system(size: 20, weight: .regular))
-                        .foregroundStyle(.white.opacity(0.78))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.62))
                 }
-                .frame(width: 160)
+                .frame(width: 130)
             }
 
-            // Legend — spec: 296pt width, 15×15 dots, 17pt text, 38pt row height
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 ForEach(segments) { segment in
                     HStack(spacing: 8) {
                         Circle()
                             .fill(colorMap[segment.colorName] ?? .gray)
-                            .frame(width: 15, height: 15)
+                            .frame(width: 11, height: 11)
+                            .overlay(
+                                Circle()
+                                    .stroke(.white.opacity(0.35), lineWidth: 0.5)
+                            )
 
                         Text(segment.name)
-                            .font(.system(size: 17, weight: .medium))
+                            .font(.system(size: 13, weight: .medium))
                             .lineLimit(1)
-                            .foregroundStyle(.white.opacity(0.86))
+                            .foregroundStyle(.white.opacity(0.82))
 
                         Spacer(minLength: 8)
 
                         Text(NumberFormatterUtil.format(segment.value))
-                            .font(.system(size: 17, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.65))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
 
                         Text(percentage(of: segment.value))
-                            .font(.system(size: 17, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.48))
-                            .frame(width: 58, alignment: .trailing)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.42))
+                            .frame(width: 46, alignment: .trailing)
                     }
-                    .padding(.horizontal, 12)
-                    .frame(height: 38)
+                    .padding(.horizontal, 10)
+                    .frame(height: 29)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(.white.opacity(0.035))
+                    )
                 }
             }
-            .frame(width: 296)
+            .frame(width: 286)
         }
         .padding(.vertical, 2)
     }
