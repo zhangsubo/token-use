@@ -31,6 +31,7 @@ final class EdgeWindowManager: NSObject {
     private var isVisible = false
     private var edge: DockEdge = .right
     private let triggerWidth: CGFloat = 43
+    private let triggerHeight: CGFloat = 157
     private let panelWidth: CGFloat = 644
     private let panelHeight: CGFloat = 718
     private let panelEdgeInset: CGFloat = 78
@@ -85,29 +86,29 @@ final class EdgeWindowManager: NSObject {
         case .right:
             triggerRect = NSRect(
                 x: screenFrame.maxX - triggerWidth,
-                y: screenFrame.minY,
+                y: screenFrame.midY - triggerHeight / 2,
                 width: triggerWidth,
-                height: screenFrame.height
+                height: triggerHeight
             )
         case .left:
             triggerRect = NSRect(
                 x: screenFrame.minX,
-                y: screenFrame.minY,
+                y: screenFrame.midY - triggerHeight / 2,
                 width: triggerWidth,
-                height: screenFrame.height
+                height: triggerHeight
             )
         case .top:
             triggerRect = NSRect(
-                x: screenFrame.minX,
+                x: screenFrame.midX - triggerHeight / 2,
                 y: screenFrame.maxY - triggerWidth,
-                width: screenFrame.width,
+                width: triggerHeight,
                 height: triggerWidth
             )
         case .bottom:
             triggerRect = NSRect(
-                x: screenFrame.minX,
+                x: screenFrame.midX - triggerHeight / 2,
                 y: screenFrame.minY,
-                width: screenFrame.width,
+                width: triggerHeight,
                 height: triggerWidth
             )
         }
@@ -304,25 +305,10 @@ final class EdgeWindowManager: NSObject {
     }
 
     private func isMouseInTriggerZone(_ mouseLoc: NSPoint, frame: NSRect) -> Bool {
-        let margin: CGFloat = 2
-        switch edge {
-        case .right:
-            return mouseLoc.x >= frame.maxX - triggerWidth - margin && mouseLoc.x <= frame.maxX + margin
-                && mouseLoc.y >= frame.minY - margin
-                && mouseLoc.y <= frame.maxY + margin
-        case .left:
-            return mouseLoc.x >= frame.minX - margin && mouseLoc.x <= frame.minX + triggerWidth + margin
-                && mouseLoc.y >= frame.minY - margin
-                && mouseLoc.y <= frame.maxY + margin
-        case .top:
-            return mouseLoc.y >= frame.maxY - triggerWidth - margin && mouseLoc.y <= frame.maxY + margin
-                && mouseLoc.x >= frame.minX - margin
-                && mouseLoc.x <= frame.maxX + margin
-        case .bottom:
-            return mouseLoc.y >= frame.minY - margin && mouseLoc.y <= frame.minY + triggerWidth + margin
-                && mouseLoc.x >= frame.minX - margin
-                && mouseLoc.x <= frame.maxX + margin
-        }
+        guard let triggerFrame = triggerView?.frame else { return false }
+        let margin: CGFloat = 5
+        let expanded = triggerFrame.insetBy(dx: -margin, dy: -margin)
+        return expanded.contains(mouseLoc)
     }
 
     private func isMouseInPanel(_ mouseLoc: NSPoint) -> Bool {
