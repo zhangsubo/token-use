@@ -67,46 +67,50 @@ final class AppState: ObservableObject {
         statusMessage = "Fetching data..."
         errorMessage = nil
 
-        do {
-            async let allTimeTask = service.fetchModels(todayOnly: false)
-            async let todayTask = service.fetchModels(todayOnly: true)
+        // Fetch allTime and today independently — one failure must not cancel the other.
+        async let allTimeResult: TokscaleReport? = {
+            try? await self.service.fetchModels(todayOnly: false)
+        }()
 
-            let allTime = try await allTimeTask
-            let today = try await todayTask
+        async let todayResult: TokscaleReport? = {
+            try? await self.service.fetchModels(todayOnly: true)
+        }()
 
+        let allTime = await allTimeResult
+        let today = await todayResult
+
+        if let allTime {
             // Save report
             if let data = try? JSONEncoder().encode(allTime) {
                 _ = try? await reportManager.saveReport(data)
             }
+        }
 
-            let newStats = TokenStats(
-                allTime: allTime,
-                today: today,
+        // Use cached allTime if live fetch failed
+        let finalAllTime: TokscaleReport?
+        if let allTime {
+            finalAllTime = allTime
+        } else {
+            finalAllTime = await reportManager.loadLatestReport()
+        }
+
+        if let finalAllTime {
+            self.stats = TokenStats(
+                allTime: finalAllTime,
+                today: today ?? TokscaleReport(
+                    groupBy: "client,model",
+                    entries: [],
+                    totalInput: 0,
+                    totalOutput: 0,
+                    totalCacheRead: 0,
+                    totalCacheWrite: 0,
+                    totalMessages: 0,
+                    totalCost: 0
+                ),
                 updatedAt: Date()
             )
-
-            self.stats = newStats
-        } catch {
-            // Try to load from cache
-            if let cached = await reportManager.loadLatestReport() {
-                let today = try? await service.fetchModels(todayOnly: true)
-                self.stats = TokenStats(
-                    allTime: cached,
-                    today: today ?? TokscaleReport(
-                        groupBy: "client,model",
-                        entries: [],
-                        totalInput: 0,
-                        totalOutput: 0,
-                        totalCacheRead: 0,
-                        totalCacheWrite: 0,
-                        totalMessages: 0,
-                        totalCost: 0
-                    ),
-                    updatedAt: Date()
-                )
-            } else {
-                self.errorMessage = error.localizedDescription
-            }
+        } else {
+            self.errorMessage = "无法获取数据，请检查 tokscale 是否已安装。"
         }
 
         isLoading = false
