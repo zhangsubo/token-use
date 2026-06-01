@@ -68,16 +68,36 @@ final class AppState: ObservableObject {
         errorMessage = nil
 
         // Fetch allTime and today independently — one failure must not cancel the other.
-        async let allTimeResult: TokscaleReport? = {
-            try? await self.service.fetchModels(todayOnly: false)
+        // 用 Result 包裹是为了同时拿到成功值与失败原因（不能只 try?，否则失败信息被吞）
+        async let allTimeResult: Result<TokscaleReport, Error> = {
+            do { return .success(try await self.service.fetchModels(todayOnly: false)) }
+            catch { return .failure(error) }
         }()
 
-        async let todayResult: TokscaleReport? = {
-            try? await self.service.fetchModels(todayOnly: true)
+        // today 走二级策略：先 --today；失败则用 --since 当天日期兜底
+        // Why: tokscale 2.x --today 在某些边界（时区/无今日数据）下可能返 0 或非 0 退出，
+        // --since YYYY-MM-DD 是更通用的"今日窗口"表达，能保证至少有一个数据通道
+        let todayResult: Result<TokscaleReport, Error> = await {
+            do {
+                return .success(try await self.service.fetchModels(todayOnly: true))
+            } catch {
+                let todayDate = Self.todayDateString()
+                do {
+                    return .success(try await self.service.fetchModels(todayOnly: false, since: todayDate))
+                } catch {
+                    // 二次失败：把首次的 --today 错误作为主错误（更接近根因）
+                    return .failure(error)
+                }
+            }
         }()
 
-        let allTime = await allTimeResult
-        let today = await todayResult
+        let allTimeOutcome = await allTimeResult
+        let allTime: TokscaleReport? = {
+            if case .success(let r) = allTimeOutcome { return r } else { return nil }
+        }()
+        let today: TokscaleReport? = {
+            if case .success(let r) = todayResult { return r } else { return nil }
+        }()
 
         if let allTime {
             // Save report
@@ -113,7 +133,23 @@ final class AppState: ObservableObject {
             self.errorMessage = "无法获取数据，请检查 tokscale 是否已安装。"
         }
 
+        // 关键修复：allTime 拉取成功但 today 失败时，必须把根因告诉用户
+        // （原先 today 静默为零值，UI 显示 0 但用户不知道为什么）
+        if finalAllTime != nil, today == nil, case .failure(let err) = todayResult {
+            self.errorMessage = "今日数据获取失败：\(err.localizedDescription)"
+        }
+
         isLoading = false
+    }
+
+    /// 用户本地"今日"日期，YYYY-MM-DD。
+    /// Why: --since 需要本地日历日期（不是 UTC），否则跨时区用户会在凌晨看到"昨日"窗口
+    private static func todayDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = .current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.string(from: Date())
     }
 
     private func startTimer() {
