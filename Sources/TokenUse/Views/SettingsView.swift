@@ -219,6 +219,7 @@ struct SettingsView: View {
             Toggle("启动后自动检查更新", isOn: $settings.enableAutoUpdate)
                 .toggleStyle(.switch)
                 .controlSize(.small)
+                .disabled(!AppDelegate.isSparkleConfigured)
 
             if let last = settings.lastUpdateCheckDate {
                 Text("上次检查：\(Self.relativeDate(last))")
@@ -238,7 +239,9 @@ struct SettingsView: View {
                 Image(systemName: "info.circle")
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.4))
-                Text("新版本将通过 Sparkle 安全下载并自动替换。")
+                Text(AppDelegate.isSparkleConfigured
+                    ? "新版本将通过 Sparkle 安全下载并自动替换。"
+                    : "当前包未配置 Sparkle 公钥，自动更新已暂停。")
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.45))
             }

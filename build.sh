@@ -17,12 +17,13 @@ BUILD_DIR=".build/arm64-apple-macosx/release"
 APP_BUNDLE="$APP_NAME.app"
 RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 ZIP_NAME="${APP_NAME}.zip"
+PROJECT_DIR="$(pwd -P)"
 
 MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-cache"
-export SWIFTPM_CACHE_PATH="$PWD/.build/swiftpm-cache"
+export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache-physical"
+export SWIFTPM_CACHE_PATH="$PROJECT_DIR/.build/swiftpm-cache-physical"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFTPM_CACHE_PATH"
 
 echo "==> Building TokenUse (version $MARKETING_VERSION, build $BUILD_NUMBER)..."

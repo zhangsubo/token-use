@@ -74,18 +74,25 @@ final class AppState: ObservableObject {
             catch { return .failure(error) }
         }()
 
-        // today 走二级策略：先 --today；失败则用 --since 当天日期兜底
-        // Why: tokscale 2.x --today 在某些边界（时区/无今日数据）下可能返 0 或非 0 退出，
-        // --since YYYY-MM-DD 是更通用的"今日窗口"表达，能保证至少有一个数据通道
+        let todayDate = Self.todayDateString()
+
+        // today 走二级策略：优先 --since 当天日期，再用 --today 兜底。
+        // Why: tokscale 2.x --today 有时会返回 0 token 的"空成功"结果；
+        // --since YYYY-MM-DD 在本机实测更稳定地表达用户本地日历日窗口。
         let todayResult: Result<TokscaleReport, Error> = await {
             do {
-                return .success(try await self.service.fetchModels(todayOnly: true))
+                let report = try await self.service.fetchModels(todayOnly: false, since: todayDate)
+                if report.totalTokens > 0 {
+                    return .success(report)
+                }
+
+                let fallback = try await self.service.fetchModels(todayOnly: true)
+                return .success(fallback)
             } catch {
-                let todayDate = Self.todayDateString()
                 do {
-                    return .success(try await self.service.fetchModels(todayOnly: false, since: todayDate))
+                    return .success(try await self.service.fetchModels(todayOnly: true))
                 } catch {
-                    // 二次失败：把首次的 --today 错误作为主错误（更接近根因）
+                    // 二次失败：把首次的 --since 错误作为主错误（更接近根因）
                     return .failure(error)
                 }
             }
