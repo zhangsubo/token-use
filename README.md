@@ -20,7 +20,19 @@ https://github.com/zhangsubo/token-use
 
 ## 安装与运行
 
-### 方式一：直接运行
+### 方式一：从 Release 下载（推荐）
+
+从 [Releases](https://github.com/zhangsubo/token-use/releases) 下载最新 `TokenUse.zip`，解压得到 `TokenUse.app`。
+
+**首次打开**（macOS Gatekeeper 提示）：
+
+1. 双击 `TokenUse.app` —— 系统提示"无法打开，因为来自身份不明的开发者"
+2. 在 Finder 右键 `TokenUse.app` → 打开 → 再次点"打开"确认
+3. 此后双击即可直接运行
+
+**自动更新**：app 启动后会通过 [Sparkle](https://sparkle-project.org) 自动检查更新（appcast 在 [gh-pages](https://zhangsubo.github.io/token-use/appcast.xml)），设置页可开关 / 手动触发。
+
+### 方式二：本地构建
 
 ```bash
 git clone https://github.com/zhangsubo/token-use.git
@@ -30,10 +42,18 @@ cp -R TokenUse.app ~/Applications/
 open ~/Applications/TokenUse.app
 ```
 
-### 方式二：开发调试
+### 方式三：开发调试
 
 ```bash
 swift run
+```
+
+### 环境变量
+
+`build.sh` 接收两个 env 用于版本注入（CI 自动设）：
+
+```bash
+MARKETING_VERSION=0.2.0 BUILD_NUMBER=42 ./build.sh
 ```
 
 ## 项目结构
@@ -68,3 +88,14 @@ token-use/
 - Swift Charts（圆环图）
 - AppKit（NSPanel 边缘触发、NSEvent 全局鼠标监控）
 - Combine / Timer（30 分钟轮询）
+- [Sparkle 2.x](https://github.com/sparkle-project/Sparkle)（应用内自动更新）
+- GitHub Actions（tag push 触发 release + ad-hoc 签 + appcast 发布）
+
+## 发布流程
+
+```bash
+git tag v0.2.0
+git push --tags
+```
+
+CI 自动：build → ad-hoc 签 → zip → EdDSA 签 → GitHub Release → 提交 `gh-pages` 分支托管 appcast。用户启动 app 后 Sparkle 自动检测并提示升级。
