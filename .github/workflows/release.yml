@@ -1,0 +1,180 @@
+name: Release
+
+# 触发：git push --tags v*.*.*
+# 例如 git tag v1.2.3 && git push --tags → 触发 release job
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# 最小权限：写 release 资产 + push gh-pages
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build + Sign + Release
+    runs-on: macos-latest   # GitHub 提供的 arm64 runner（Apple Silicon）
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需完整历史以计算 appcast（后续迭代用）
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "==> Building version $VERSION"
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
+        # Sparkle 2.x 要求 macOS 14 SDK + Swift 5.9+；GitHub runner 默认 Xcode 满足
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/clang-cache
+            .build/swiftpm-cache
+            .build/repos
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Build + sign + zip
+        env:
+          MARKETING_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: ./build.sh
+
+      - name: Download Sparkle tools
+        run: |
+          # sign_update / generate_keys 来自 Sparkle 官方 release 压缩包
+          # Why 不用 brew install：CI 不希望依赖 brew 缓存；直接下二进制可控
+          mkdir -p bin
+          curl -L --fail -o sparkle.tar.xz \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.6.0/Sparkle-2.6.0.tar.xz
+          tar -xJf sparkle.tar.xz -C bin --strip-components=1
+          ls -la bin/
+
+      - name: Sign zip with EdDSA
+        id: sign
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "ERROR: SPARKLE_PRIVATE_KEY secret is not set"
+            echo "请在 GitHub repo Settings → Secrets → Actions 添加 SPARKLE_PRIVATE_KEY"
+            echo "生成方式：本地 ./bin/generate_keys → dsa_private.pem 整段 base64"
+            exit 1
+          fi
+
+          # sign_update 从 stdin 读私钥，stdout 输出两行：
+          #   <edSignature>
+          #   <length>
+          echo "$SPARKLE_PRIVATE_KEY" | ./bin/sign_update TokenUse.zip > sig.txt
+          cat sig.txt
+          SIGNATURE=$(awk 'NR==1{print; exit}' sig.txt)
+          LENGTH=$(awk 'NR==2{print; exit}' sig.txt)
+
+          if [ -z "$SIGNATURE" ] || [ -z "$LENGTH" ]; then
+            echo "ERROR: sign_update output invalid"
+            exit 1
+          fi
+
+          echo "signature=$SIGNATURE" >> "$GITHUB_OUTPUT"
+          echo "length=$LENGTH" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: TokenUse.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update gh-pages appcast
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNATURE: ${{ steps.sign.outputs.signature }}
+          LENGTH: ${{ steps.sign.outputs.length }}
+        run: |
+          set -euo pipefail
+
+          PUB_DATE=$(date -u +"%a, %d %b %Y %H:%M:%S +0000")
+          DOWNLOAD_URL="https://github.com/zhangsubo/token-use/releases/download/v${VERSION}/TokenUse.zip"
+
+          ITEM=$(cat <<XML
+              <item>
+                  <title>Version ${VERSION}</title>
+                  <sparkle:version>${VERSION}</sparkle:version>
+                  <pubDate>${PUB_DATE}</pubDate>
+                  <enclosure
+                      url="${DOWNLOAD_URL}"
+                      sparkle:edSignature="${SIGNATURE}"
+                      length="${LENGTH}"
+                      type="application/octet-stream" />
+              </item>
+          XML
+          )
+
+          # 准备 gh-pages 分支
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          # 合并旧 item + 新 item（保留历史）
+          # Why：每次全量重写会丢历史，Sparkle 会用 sparkle:version 比对，老版本检测不到
+          if [ -f appcast.xml ] && grep -q '<item>' appcast.xml; then
+            # 抽取 </channel> 之前的所有 <item>...</item>
+            EXISTING_ITEMS=$(awk '/<item>/,/<\/item>/' appcast.xml || true)
+            # 用 awk 重新拼装
+            {
+              echo '<?xml version="1.0" encoding="utf-8"?>'
+              echo '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
+              echo '  <channel>'
+              echo '    <title>TokenUse Changelog</title>'
+              echo "$EXISTING_ITEMS"
+              echo "$ITEM"
+              echo '  </channel>'
+              echo '</rss>'
+            } > appcast.xml.new
+            mv appcast.xml.new appcast.xml
+          else
+            cat > appcast.xml <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                <title>TokenUse Changelog</title>
+          ${ITEM}
+            </channel>
+          </rss>
+          XML
+          fi
+
+          git add appcast.xml
+          if git diff --cached --quiet; then
+            echo "==> No appcast change, skipping commit"
+          else
+            git commit -m "appcast: v${VERSION}"
+            git push origin gh-pages
+            echo "==> gh-pages updated"
+          fi
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### Release v${{ steps.version.outputs.version }} published ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Download: https://github.com/zhangsubo/token-use/releases/download/v${{ steps.version.outputs.version }}/TokenUse.zip" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Appcast: https://zhangsubo.github.io/token-use/appcast.xml" >> "$GITHUB_STEP_SUMMARY"

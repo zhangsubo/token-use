@@ -50,6 +50,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 24) {
                     mascotSection
                     refreshSection
+                    updateSection
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 20)
@@ -198,7 +199,67 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Auto Update Section
+
+    private var updateSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("自动更新")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white)
+
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.green.opacity(0.7))
+                Text("当前版本：v\(currentVersion)")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+
+            Toggle("启动后自动检查更新", isOn: $settings.enableAutoUpdate)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+            if let last = settings.lastUpdateCheckDate {
+                Text("上次检查：\(Self.relativeDate(last))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            Button {
+                (NSApp.delegate as? AppDelegate)?.checkForUpdates()
+            } label: {
+                Label("立即检查更新", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.4))
+                Text("新版本将通过 Sparkle 安全下载并自动替换。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+            .padding(.top, 2)
+        }
+    }
+
     // MARK: - Helpers
+
+    /// 当前 .app 的 CFBundleShortVersionString。读不到时回退 "0.0.0"。
+    private var currentVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
+    }
+
+    /// 相对时间本地化（"3 分钟前"），避免每次设置页打开时 DateFormatter 重型格式化
+    private static func relativeDate(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
 
     private func setupIntervalState() {
         let current = settings.refreshInterval

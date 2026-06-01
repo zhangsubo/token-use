@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TokenUse.app Info.plist 模板
+
+  build.sh 复制本文件到 TokenUse.app/Contents/Info.plist，
+  然后用 PlistBuddy 注入 CFBundleShortVersionString / CFBundleVersion。
+
+  Sparkle 密钥说明：
+  - SUPublicEDKey 不会提交到仓库（避免任何"假凭证"被持久化）。
+  - 首次发布前需手动追加此 key 到本模板：
+      git clone https://github.com/sparkle-project/Sparkle
+      cd Sparkle && make
+      ./build/Release/bin/generate_keys
+      # 把 dsa_pub.pem 整段（含 BEGIN/END 标记）填到下方 SUPublicEDKey 的 <string> 里
+  - 配套的私钥 dsa_private.pem 整段 base64 存到 GitHub Secret SPARKLE_PRIVATE_KEY
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>TokenUse</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.tokenuse.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>TokenUse</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__MARKETING_VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__BUILD_NUMBER__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 zhangsubo</string>
+
+    <!-- Sparkle 2.x 自动更新配置。SUPublicEDKey 见上方注释，需手动追加。 -->
+    <key>SUFeedURL</key>
+    <string>https://zhangsubo.github.io/token-use/appcast.xml</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUCheckAtStartupIntervalInSeconds</key>
+    <integer>86400</integer>
+</dict>
+</plist>
