@@ -125,6 +125,19 @@ actor TokscaleService {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: tokscalePath)
+        
+        // GUI 应用不继承 shell 环境变量，tokscale 需要 HOME/PATH/NODE_PATH 才能正确读取数据
+        var env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        env["HOME"] = home
+        if env["PATH"] == nil {
+            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:\(home)/.npm-global/bin"
+        }
+        if env["NODE_PATH"] == nil {
+            env["NODE_PATH"] = "/usr/local/lib/node_modules:/opt/homebrew/lib/node_modules:\(home)/.npm-global/lib/node_modules"
+        }
+        process.environment = env
+        
         var args = ["models", "--json", "--no-spinner"]
         // 二选一：--today 是首选；若已指定 --since YYYY-MM-DD 则用 since 走日期窗口
         // Why: tokscale 2.x --today 在少数边界（跨时区/会话数据缺失）下会返回 0，
