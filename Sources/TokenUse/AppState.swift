@@ -11,6 +11,7 @@ final class AppState: ObservableObject {
     @Published var isLoading: Bool = false
 
     private let service = TokscaleService.shared
+    private let nativeUsageService = NativeUsageService.shared
     private let reportManager = ReportManager.shared
     private var timer: Timer?
     private var hasCheckedInstall = false
@@ -76,26 +77,50 @@ final class AppState: ObservableObject {
 
         let todayDate = Self.todayDateString()
 
-        // today 走二级策略：优先 --since 当天日期，再用 --today 兜底。
-        // Why: tokscale 2.x --today 有时会返回 0 token 的"空成功"结果；
-        // --since YYYY-MM-DD 在本机实测更稳定地表达用户本地日历日窗口。
+        // Today 拉取顺序：tokscale --today -> tokscale --since -> 原生本地日志聚合。
+        // 非零结果优先；如果三步都成功但均为 0，则接受最后一个 0 结果。
         let todayResult: Result<TokscaleReport, Error> = await {
+            var firstError: Error?
+            var zeroReport: TokscaleReport?
+
+            do {
+                let report = try await self.service.fetchModels(todayOnly: true)
+                if report.totalTokens > 0 {
+                    return .success(report)
+                }
+                zeroReport = report
+            } catch {
+                firstError = error
+            }
+
             do {
                 let report = try await self.service.fetchModels(todayOnly: false, since: todayDate)
                 if report.totalTokens > 0 {
                     return .success(report)
                 }
-
-                let fallback = try await self.service.fetchModels(todayOnly: true)
-                return .success(fallback)
+                zeroReport = report
             } catch {
-                do {
-                    return .success(try await self.service.fetchModels(todayOnly: true))
-                } catch {
-                    // 二次失败：把首次的 --since 错误作为主错误（更接近根因）
-                    return .failure(error)
+                if firstError == nil {
+                    firstError = error
                 }
             }
+
+            do {
+                let report = try await self.nativeUsageService.fetchToday()
+                if report.totalTokens > 0 {
+                    return .success(report)
+                }
+                zeroReport = report
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+
+            if let zeroReport {
+                return .success(zeroReport)
+            }
+            return .failure(firstError ?? NativeUsageError.noSupportedLogs)
         }()
 
         let allTimeOutcome = await allTimeResult
@@ -131,6 +156,7 @@ final class AppState: ObservableObject {
                     totalOutput: 0,
                     totalCacheRead: 0,
                     totalCacheWrite: 0,
+                    totalReasoning: 0,
                     totalMessages: 0,
                     totalCost: 0
                 ),

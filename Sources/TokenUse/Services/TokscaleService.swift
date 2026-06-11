@@ -84,6 +84,18 @@ actor TokscaleService {
         return nil
     }
 
+    /// 找到可用的登录 shell，用于代理执行 CLI 命令。
+    /// Why: GUI 应用 Process() 不继承 shell 环境，通过登录 shell 执行可获取完整用户环境。
+    private func findLoginShell() -> String {
+        let shells = ["/bin/zsh", "/bin/bash"]
+        for shell in shells {
+            if FileManager.default.isExecutableFile(atPath: shell) {
+                return shell
+            }
+        }
+        return "/bin/zsh" // 最后兜底，macOS 一定有
+    }
+
     func installTokscale() async throws {
         guard !checkInstallation() else { return }
 
@@ -123,32 +135,20 @@ actor TokscaleService {
             throw TokscaleError.notInstalled
         }
 
+        // GUI 应用不继承 shell 环境变量，通过登录 shell 执行以获取完整用户环境
+        // Why: 直接 Process() 跑 tokscale（Node.js CLI）缺少 HOME/PATH/NODE_PATH 等变量
+        // 登录 shell 会加载 .zprofile/.zshrc，继承全部用户环境，比手动修补 env 更可靠
+        let shell = findLoginShell()
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: tokscalePath)
-        
-        // GUI 应用不继承 shell 环境变量，tokscale 需要 HOME/PATH/NODE_PATH 才能正确读取数据
-        var env = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        env["HOME"] = home
-        if env["PATH"] == nil {
-            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:\(home)/.npm-global/bin"
-        }
-        if env["NODE_PATH"] == nil {
-            env["NODE_PATH"] = "/usr/local/lib/node_modules:/opt/homebrew/lib/node_modules:\(home)/.npm-global/lib/node_modules"
-        }
-        process.environment = env
-        
-        var args = ["models", "--json", "--no-spinner"]
-        // 二选一：--today 是首选；若已指定 --since YYYY-MM-DD 则用 since 走日期窗口
-        // Why: tokscale 2.x --today 在少数边界（跨时区/会话数据缺失）下会返回 0，
-        // --since 当天日期作为兜底能保证"今日"始终有窗口
+        process.executableURL = URL(fileURLWithPath: shell)
+
+        var cmd = "'\(tokscalePath)' models --json --no-spinner"
         if todayOnly {
-            args.append("--today")
+            cmd += " --today"
         } else if let since {
-            args.append("--since")
-            args.append(since)
+            cmd += " --since \(since)"
         }
-        process.arguments = args
+        process.arguments = ["-l", "-c", cmd]
 
         // stderr 必须独立 Pipe 捕获——原先走 FileHandle.nullDevice 时
         // 任何 CLI 警告/错误都被吞掉，AppState 的 try? 进一步把异常变 nil，

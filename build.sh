@@ -98,6 +98,11 @@ cp "$PLIST_TEMPLATE" "$APP_BUNDLE/Contents/Info.plist"
 # Bundle-level ad-hoc 签
 # Why：Sparkle 强制要求 sealed bundle（Info.plist bound、Sealed Resources non-empty）
 # 单纯 linker 阶段的 adhoc 不够，必须对 .app 整体再签一次
+# Why iCloud/workspace copies can attach extended attributes to embedded frameworks,
+# and codesign rejects those as resource forks or Finder metadata.
+echo "==> Clearing extended attributes..."
+xattr -cr "$APP_BUNDLE" 2>/dev/null || true
+
 echo "==> Ad-hoc codesigning bundle..."
 codesign --force --deep --sign - "$APP_BUNDLE"
 

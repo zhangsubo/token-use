@@ -25,11 +25,12 @@ struct TokscaleReport: Codable, Sendable {
     let totalOutput: Int
     let totalCacheRead: Int
     let totalCacheWrite: Int
+    let totalReasoning: Int?
     let totalMessages: Int
     let totalCost: Double
 
     var totalTokens: Int {
-        totalInput + totalOutput + totalCacheRead + totalCacheWrite
+        totalInput + totalOutput + totalCacheRead + totalCacheWrite + (totalReasoning ?? 0)
     }
 }
 
