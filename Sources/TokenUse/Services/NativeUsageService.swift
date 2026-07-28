@@ -6,7 +6,7 @@ enum NativeUsageError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noSupportedLogs:
-            return "未找到 Codex、OpenCode、Kimi 或 Claude Code 的本地使用日志"
+            return "未找到 Codex、Claude、Kimi、Mimo 或 OpenCode 的本地使用日志"
         }
     }
 }
@@ -18,11 +18,23 @@ actor NativeUsageService {
 
     func fetchToday() async throws -> TokscaleReport {
         let interval = Self.localDayInterval(for: Date())
+        return try await fetch(interval: interval)
+    }
+
+    func fetchAllTime() async throws -> TokscaleReport {
+        // 使用一个足够久远的起始日期（10年前）到现在
+        let start = Date().addingTimeInterval(-86400 * 365 * 10)
+        let interval = DateInterval(start: start, end: Date())
+        return try await fetch(interval: interval)
+    }
+
+    private func fetch(interval: DateInterval) async throws -> TokscaleReport {
         var accumulator = UsageAccumulator()
 
         scanCodex(interval: interval, into: &accumulator)
         scanClaude(interval: interval, into: &accumulator)
         scanKimi(interval: interval, into: &accumulator)
+        scanMimo(interval: interval, into: &accumulator)
         scanOpenCode(interval: interval, into: &accumulator)
 
         if accumulator.isEmpty {
@@ -147,6 +159,45 @@ actor NativeUsageService {
                     reasoning: 0,
                     messageCount: input + output + cacheRead + cacheWrite > 0 ? 1 : 0,
                     cost: PriceResolver.estimate(model: "kimi-for-coding", provider: "moonshot", input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite, reasoning: 0)
+                )
+            }
+        }
+    }
+
+    private func scanMimo(interval: DateInterval, into accumulator: inout UsageAccumulator) {
+        let root = homeDirectory.appendingPathComponent(".mimo/sessions")
+        for file in jsonlFiles(under: root) {
+            guard (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                .map({ $0 >= interval.start.addingTimeInterval(-86_400) }) == true else {
+                continue
+            }
+
+            for object in jsonObjects(in: file) {
+                guard string(object["type"]) == "assistant",
+                      let timestamp = date(from: object["timestamp"]),
+                      interval.contains(timestamp),
+                      let message = object["message"] as? [String: Any],
+                      let usage = message["usage"] as? [String: Any] else {
+                    continue
+                }
+
+                let model = string(message["model"]) ?? "unknown"
+                let input = int(usage["input_tokens"])
+                let output = int(usage["output_tokens"])
+                let cacheRead = int(usage["cache_read_input_tokens"])
+                let cacheWrite = int(usage["cache_creation_input_tokens"])
+
+                accumulator.add(
+                    client: "mimocode",
+                    provider: "xiaomi",
+                    model: model,
+                    input: input,
+                    output: output,
+                    cacheRead: cacheRead,
+                    cacheWrite: cacheWrite,
+                    reasoning: 0,
+                    messageCount: input + output + cacheRead + cacheWrite > 0 ? 1 : 0,
+                    cost: PriceResolver.estimate(model: model, provider: "xiaomi", input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite, reasoning: 0)
                 )
             }
         }
