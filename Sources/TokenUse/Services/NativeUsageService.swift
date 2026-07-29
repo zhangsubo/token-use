@@ -1,13 +1,18 @@
 import Foundation
 import SQLite
 
+// MARK: - NativeUsageService
+/// 原生日志扫描服务
+/// 直接读取本地 AI 客户端的使用日志（Claude、Codex、Kimi、Mimo、OpenCode）
+/// 替代了之前依赖 tokscale CLI 的方案
+
 enum NativeUsageError: Error, LocalizedError {
     case noSupportedLogs
 
     var errorDescription: String? {
         switch self {
         case .noSupportedLogs:
-            return "未找到 Codex、Claude、Kimi 或 Mimo 的本地使用日志"
+            return "未找到 Codex、Claude、Kimi、Mimo 或 OpenCode 的本地使用日志"
         }
     }
 }

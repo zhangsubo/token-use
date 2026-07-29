@@ -1,5 +1,9 @@
 import Foundation
 
+// MARK: - TokscaleService
+// ⚠️ 已废弃：此服务已被 NativeUsageService 替代
+// 保留此文件仅用于向后兼容，实际数据获取请使用 NativeUsageService
+
 enum TokscaleError: Error, LocalizedError {
     case notInstalled
     case installFailed(String)
@@ -20,6 +24,8 @@ enum TokscaleError: Error, LocalizedError {
     }
 }
 
+/// ⚠️ 已废弃：请使用 NativeUsageService 替代
+/// 此 actor 依赖外部 tokscale CLI 工具，现已改为直接扫描本地日志
 actor TokscaleService {
     static let shared = TokscaleService()
 

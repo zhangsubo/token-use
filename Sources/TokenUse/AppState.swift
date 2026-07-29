@@ -1,6 +1,13 @@
 import SwiftUI
 import Combine
 
+// MARK: - AppState
+/// 全局应用状态管理
+/// 职责：
+/// - 智能缓存策略（1小时有效期）：缓存有效时立即加载，后台更新今日数据
+/// - 定时刷新（默认 30 分钟，可在设置中调整）
+/// - 协调 NativeUsageService 和 ReportManager 的数据流
+
 @MainActor
 final class AppState: ObservableObject {
     static let shared = AppState()
