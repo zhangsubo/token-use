@@ -85,16 +85,29 @@ jobs:
           # sign_update 从 stdin 读私钥，stdout 输出两行：
           #   <edSignature>
           #   <length>
-          echo "$SPARKLE_PRIVATE_KEY" | ./bin/sign_update TokenUse.zip > sig.txt
+          # 使用 2>&1 捕获错误输出以便调试
+          echo "🔐 Signing TokenUse.zip with EdDSA..."
+          if ! echo "$SPARKLE_PRIVATE_KEY" | ./bin/sign_update TokenUse.zip > sig.txt 2>&1; then
+            echo "❌ sign_update execution failed"
+            echo "Output:"
+            cat sig.txt
+            exit 1
+          fi
+
+          echo "📄 sign_update output:"
           cat sig.txt
+
           SIGNATURE=$(awk 'NR==1{print; exit}' sig.txt)
           LENGTH=$(awk 'NR==2{print; exit}' sig.txt)
 
           if [ -z "$SIGNATURE" ] || [ -z "$LENGTH" ]; then
-            echo "ERROR: sign_update output invalid"
+            echo "❌ sign_update output invalid (empty signature or length)"
+            echo "Expected format: line 1 = signature, line 2 = length"
             exit 1
           fi
 
+          echo "✅ Signature: ${SIGNATURE:0:20}..."
+          echo "✅ Length: $LENGTH"
           echo "signature=$SIGNATURE" >> "$GITHUB_OUTPUT"
           echo "length=$LENGTH" >> "$GITHUB_OUTPUT"
 
