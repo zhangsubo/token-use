@@ -82,17 +82,24 @@ jobs:
             exit 1
           fi
 
-          # sign_update 从 stdin 读私钥，stdout 输出两行：
-          #   <edSignature>
-          #   <length>
-          # 使用 2>&1 捕获错误输出以便调试
+          # sign_update 需要使用 --ed-key-file 参数指定私钥文件
+          # CI 环境没有 macOS Keychain，所以不能从 stdin 读取
           echo "🔐 Signing TokenUse.zip with EdDSA..."
-          if ! echo "$SPARKLE_PRIVATE_KEY" | ./bin/sign_update TokenUse.zip > sig.txt 2>&1; then
+
+          # 将私钥写入临时文件
+          echo "$SPARKLE_PRIVATE_KEY" > private_key.pem
+
+          # 使用 --ed-key-file 参数签名
+          if ! ./bin/sign_update --ed-key-file private_key.pem TokenUse.zip > sig.txt 2>&1; then
             echo "❌ sign_update execution failed"
             echo "Output:"
             cat sig.txt
+            rm -f private_key.pem
             exit 1
           fi
+
+          # 清理私钥文件
+          rm -f private_key.pem
 
           echo "📄 sign_update output:"
           cat sig.txt
