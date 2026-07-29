@@ -2,7 +2,11 @@
 
 macOS 菜单栏应用，可视化展示本地 AI 工具的 Token 使用量统计。
 
-https://github.com/zhangsubo/token-use
+[![Latest Release](https://img.shields.io/github/v/release/zhangsubo/token-use)](https://github.com/zhangsubo/token-use/releases/latest)
+[![Download](https://img.shields.io/github/downloads/zhangsubo/token-use/total)](https://github.com/zhangsubo/token-use/releases/latest)
+[![License](https://img.shields.io/github/license/zhangsubo/token-use)](LICENSE)
+
+**[📦 下载最新版本 (v0.3.0)](https://github.com/zhangsubo/token-use/releases/download/v0.3.0/TokenUse.zip)**
 
 ## 功能
 
@@ -23,15 +27,16 @@ https://github.com/zhangsubo/token-use
 
 ### 方式一：从 Release 下载（推荐）
 
-从 [Releases](https://github.com/zhangsubo/token-use/releases) 下载最新 `TokenUse.zip`，解压得到 `TokenUse.app`。
+**[📦 下载 v0.3.0](https://github.com/zhangsubo/token-use/releases/download/v0.3.0/TokenUse.zip)** | [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
-**首次打开**（macOS Gatekeeper 提示）：
+1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
+2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
+3. 首次打开需要绕过 macOS Gatekeeper：
+   - 双击 `TokenUse.app` → 系统提示"无法打开"
+   - 右键 `TokenUse.app` → 打开 → 再次点"打开"确认
+   - 此后可直接双击运行
 
-1. 双击 `TokenUse.app` —— 系统提示"无法打开，因为来自身份不明的开发者"
-2. 在 Finder 右键 `TokenUse.app` → 打开 → 再次点"打开"确认
-3. 此后双击即可直接运行
-
-**自动更新**：app 启动后会通过 [Sparkle](https://sparkle-project.org) 自动检查更新（appcast 在 [gh-pages](https://zhangsubo.github.io/token-use/appcast.xml)），设置页可开关 / 手动触发。
+**自动更新**：应用会通过 [Sparkle](https://sparkle-project.org) 自动检查更新（每 24 小时一次），或在设置中手动触发。新版本会自动下载、验证签名并安装。
 
 ### 方式二：本地构建
 
