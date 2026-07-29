@@ -54,19 +54,21 @@ jobs:
       - name: Download Sparkle tools
         run: |
           # sign_update 来自 Sparkle 官方 release 压缩包
-          # Why 不用 brew install：CI 不希望依赖 brew 缓存；直接下二进制可控
           curl -L --fail -o sparkle.tar.xz \
             https://github.com/sparkle-project/Sparkle/releases/download/2.6.0/Sparkle-2.6.0.tar.xz
           tar -xJf sparkle.tar.xz
-          # Sparkle-2.6.0.tar.xz 解压后的结构是顶层包含 bin/ 目录
-          ls -la
-          # 查找 sign_update 的实际位置
-          find . -name sign_update -type f
-          # 复制到当前目录的 bin/ 便于后续步骤使用
-          mkdir -p bin
-          cp -v */sign_update bin/ || cp -v sign_update bin/
-          chmod +x bin/sign_update
-          ls -la bin/
+
+          # Sparkle 压缩包解压后 bin/ 目录已经存在
+          # 确保 sign_update 可执行
+          if [ -f bin/sign_update ]; then
+            chmod +x bin/sign_update
+            echo "✅ sign_update ready at ./bin/sign_update"
+            ls -lh bin/sign_update
+          else
+            echo "❌ sign_update not found"
+            find . -name sign_update -type f | head -5
+            exit 1
+          fi
 
       - name: Sign zip with EdDSA
         id: sign
