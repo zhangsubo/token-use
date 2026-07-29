@@ -46,9 +46,11 @@
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 zhangsubo</string>
 
-    <!-- Sparkle 2.x 自动更新配置。SUPublicEDKey 见上方注释，需手动追加。 -->
+    <!-- Sparkle 2.x 自动更新配置 -->
     <key>SUFeedURL</key>
     <string>https://zhangsubo.github.io/token-use/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>gxIwYctaW0/FtXmFaM3tytB/dWSpykXjovyPxKqMq0U=</string>
     <key>SUEnableAutomaticChecks</key>
     <true/>
     <key>SUCheckAtStartupIntervalInSeconds</key>
