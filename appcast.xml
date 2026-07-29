@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+      <title>TokenUse Changelog</title>
+    <item>
+        <title>Version 0.3.0</title>
+        <sparkle:version>0.3.0</sparkle:version>
+        <pubDate>Wed, 29 Jul 2026 08:05:04 +0000</pubDate>
+        <enclosure
+            url="https://github.com/zhangsubo/token-use/releases/download/v0.3.0/TokenUse.zip"
+            sparkle:edSignature="dAznDxrP3zH2sOBVNmr8HVcYr4nRA7epnH2oYFkENIW3In6DowSUurwWjGl1ucs5EDIrehnua4fPIyij5LvwBA=="
+            length="6942185"
+            type="application/octet-stream" />
+    </item>
+  </channel>
+</rss>
