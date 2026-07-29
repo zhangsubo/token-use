@@ -25,8 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DebugLogger.log("🚀 applicationDidFinishLaunching 开始")
+
         NSApp.setActivationPolicy(.accessory)
+        DebugLogger.log("✅ 设置 accessory 模式完成")
+
         EdgeWindowManager.shared.setup()
+        DebugLogger.log("✅ EdgeWindowManager.setup() 完成")
 
         if SettingsManager.shared.enableAutoUpdate, Self.isSparkleConfigured {
             updaterController = SPUStandardUpdaterController(
@@ -34,12 +39,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updaterDelegate: nil,
                 userDriverDelegate: nil
             )
+            DebugLogger.log("✅ Sparkle 自动更新已启动")
+        } else {
+            DebugLogger.log("⚠️ Sparkle 自动更新未启用")
         }
 
         // 启动数据拉取
+        DebugLogger.log("📊 准备启动 AppState.shared.start()")
         Task {
             await AppState.shared.start()
         }
+
+        DebugLogger.log("🚀 applicationDidFinishLaunching 完成")
     }
 
     /// 暴露给 UI 手动触发更新检查（如设置页"立即检查更新"按钮）

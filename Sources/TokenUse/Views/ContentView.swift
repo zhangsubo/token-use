@@ -304,11 +304,11 @@ private struct FooterStatusView: View {
             HStack(spacing: 7) {
                 Image(systemName: "info.circle")
                     .font(.system(size: 12, weight: .medium))
-                (Text("* 数据均来源于").font(.system(size: 11, weight: .regular)) +
-                 Text("tokscale").font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.7)) +
-                 Text("。使用 LiteLLM 的定价数据获取实时定价计算，支持分级定价模型和缓存代币折扣。").font(.system(size: 11, weight: .regular)))
+                (Text("* 数据均来源于本地Agent记录。使用").font(.system(size: 11, weight: .regular)) +
+                 Text("LiteLLM").font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.7)) +
+                 Text("的定价数据获取实时定价计算，支持分级定价模型和缓存Token折扣。").font(.system(size: 11, weight: .regular)))
                     .onTapGesture {
-                        if let url = URL(string: "https://github.com/junhoyeo/tokscale") {
+                        if let url = URL(string: "https://github.com/BerriAI/litellm") {
                             NSWorkspace.shared.open(url)
                         }
                     }

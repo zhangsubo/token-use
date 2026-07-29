@@ -8,6 +8,9 @@ actor ReportManager {
         return home.appendingPathComponent("Applications/token-use/report", isDirectory: true)
     }
 
+    /// 缓存有效期：1 小时
+    private let cacheValidityDuration: TimeInterval = 3600
+
     func ensureDirectoryExists() throws {
         try FileManager.default.createDirectory(
             at: reportsDirectory,
@@ -29,6 +32,7 @@ actor ReportManager {
         return fileURL
     }
 
+    /// 加载最新的报告
     func loadLatestReport() -> TokscaleReport? {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: reportsDirectory,
@@ -53,6 +57,34 @@ actor ReportManager {
         }
 
         return try? JSONDecoder().decode(TokscaleReport.self, from: data)
+    }
+
+    /// 检查缓存是否有效（最新报告创建时间在有效期内）
+    func isCacheValid() -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: reportsDirectory,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: .skipsHiddenFiles
+        ) else {
+            return false
+        }
+
+        let jsonFiles = files.filter { $0.pathExtension == "json" }
+        guard !jsonFiles.isEmpty else { return false }
+
+        let sorted = jsonFiles.sorted { url1, url2 in
+            let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+            let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+            return date1 > date2
+        }
+
+        guard let latest = sorted.first,
+              let creationDate = try? latest.resourceValues(forKeys: [.creationDateKey]).creationDate else {
+            return false
+        }
+
+        let age = Date().timeIntervalSince(creationDate)
+        return age < cacheValidityDuration
     }
 
     func listReports() -> [URL] {
