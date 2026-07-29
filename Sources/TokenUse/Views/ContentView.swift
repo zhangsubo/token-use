@@ -384,10 +384,11 @@ private struct WorkingMascotView: View {
         }
         // Fall back to bundle default
         let candidates: [URL?] = [
-            Bundle.module.url(forResource: "working-mascot", withExtension: "png"),
             Bundle.main.url(forResource: "working-mascot", withExtension: "png"),
             Bundle.main.url(forResource: "working-mascot", withExtension: "png", subdirectory: "TokenUse_TokenUse.bundle"),
             Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/TokenUse_TokenUse.bundle/working-mascot.png"),
+            // Bundle.module may crash in distributed .app if resource bundle path is unexpected
+            (try? Bundle.module.url(forResource: "working-mascot", withExtension: "png")) ?? nil,
         ]
         for case let url? in candidates {
             if FileManager.default.fileExists(atPath: url.path) {
