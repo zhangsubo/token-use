@@ -337,12 +337,13 @@ struct SettingsView: View {
     }
 
     private func loadDefaultMascot() -> NSImage? {
+        // NOTE: Bundle.module is SPM-generated and may crash in precompiled .app,
+        // so we only use Bundle.main and explicit paths
         let candidates: [URL?] = [
             Bundle.main.url(forResource: "working-mascot", withExtension: "png"),
             Bundle.main.url(forResource: "working-mascot", withExtension: "png", subdirectory: "TokenUse_TokenUse.bundle"),
             Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/TokenUse_TokenUse.bundle/working-mascot.png"),
-            // Bundle.module may crash in distributed .app if resource bundle path is unexpected
-            (try? Bundle.module.url(forResource: "working-mascot", withExtension: "png")) ?? nil,
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/working-mascot.png"),
         ]
         for case let url? in candidates {
             if let image = NSImage(contentsOf: url) { return image }
