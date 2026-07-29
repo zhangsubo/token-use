@@ -22,5 +22,15 @@
             length="6942245"
             type="application/octet-stream" />
     </item>
+    <item>
+        <title>Version 0.3.1</title>
+        <sparkle:version>0.3.1</sparkle:version>
+        <pubDate>Wed, 29 Jul 2026 08:45:14 +0000</pubDate>
+        <enclosure
+            url="https://github.com/zhangsubo/token-use/releases/download/v0.3.1/TokenUse.zip"
+            sparkle:edSignature="evtu8ast3WgrfA9GxRp/o8b8Kkis6yy32hSdyAZREnIznDFNK/h9AWjeLJ0KwU3y0MgWkbdCzAeQq/aLjf7zAA=="
+            length="6941655"
+            type="application/octet-stream" />
+    </item>
   </channel>
 </rss>
