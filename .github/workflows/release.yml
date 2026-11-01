@@ -30,9 +30,17 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "==> Building version $VERSION"
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
-        # Sparkle 2.x 要求 macOS 14 SDK + Swift 5.9+；GitHub runner 默认 Xcode 满足
+      - name: Select Xcode (Swift 6+)
+        run: |
+          if ! swift --version | grep -q "Swift version 6"; then
+            for xc in /Applications/Xcode_16*.app /Applications/Xcode_26*.app /Applications/Xcode.app; do
+              if [ -d "$xc" ]; then
+                sudo xcode-select -s "$xc"
+                break
+              fi
+            done
+          fi
+          swift --version
 
       - name: Cache SwiftPM
         uses: actions/cache@v4
@@ -131,6 +139,7 @@ jobs:
       - name: Update gh-pages appcast
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
           SIGNATURE: ${{ steps.sign.outputs.signature }}
           LENGTH: ${{ steps.sign.outputs.length }}
         run: |
@@ -142,7 +151,8 @@ jobs:
           ITEM=$(cat <<XML
               <item>
                   <title>Version ${VERSION}</title>
-                  <sparkle:version>${VERSION}</sparkle:version>
+                  <sparkle:version>${BUILD_NUMBER}</sparkle:version>
+                  <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
                   <pubDate>${PUB_DATE}</pubDate>
                   <enclosure
                       url="${DOWNLOAD_URL}"

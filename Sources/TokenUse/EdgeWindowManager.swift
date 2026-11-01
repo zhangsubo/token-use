@@ -22,23 +22,42 @@ final class TriggerState: ObservableObject {
     private init() {}
 }
 
+private final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 @MainActor
-final class EdgeWindowManager: NSObject {
+final class EdgeWindowManager: NSObject, ObservableObject {
     static let shared = EdgeWindowManager()
 
-    private var window: NSWindow?
+    private var window: NSPanel?
     private var triggerView: NSWindow?
     private var isVisible = false
     private var edge: DockEdge = .right
-    private let triggerWidth: CGFloat = 43
-    private let triggerHeight: CGFloat = 157
+    private let triggerWidth: CGFloat = 50
+    private let triggerHeight: CGFloat = 236
     private let panelWidth: CGFloat = 644
     private let panelHeight: CGFloat = 670
-    private let panelEdgeInset: CGFloat = 78
+    private let panelEdgeInset: CGFloat = 60
     private let hideDelay: TimeInterval = 0.3
 
     private var hideTimer: Timer?
     private var mouseMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var screenObserver: NSObjectProtocol?
+
+    /// 当设置弹窗 / 登录窗口打开或用户固定面板时，阻止鼠标移出自动收起
+    @Published var isPinned: Bool = false
+    var isModalPresenting: Bool = false {
+        didSet {
+            if isModalPresenting {
+                cancelHideTimer()
+                NSApp.activate(ignoringOtherApps: true)
+                window?.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
 
     private override init() {
         super.init()
@@ -48,6 +67,7 @@ final class EdgeWindowManager: NSObject {
         createTriggerWindow()
         createPanelWindow()
         startMouseMonitoring()
+        observeScreenChanges()
     }
 
     // MARK: - Window Creation
@@ -55,7 +75,7 @@ final class EdgeWindowManager: NSObject {
     private func createPanelWindow() {
         let contentRect = NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight)
 
-        let panel = NSPanel(
+        let panel = KeyablePanel(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -63,11 +83,13 @@ final class EdgeWindowManager: NSObject {
         )
 
         panel.level = .floating
+        panel.appearance = NSAppearance(named: .darkAqua)
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
         panel.animationBehavior = .none
         panel.isMovableByWindowBackground = false
+        panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
 
         let hostingView = NSHostingView(rootView: EdgeContentView(manager: self))
@@ -121,6 +143,7 @@ final class EdgeWindowManager: NSObject {
         )
 
         trigger.level = .floating
+        trigger.appearance = NSAppearance(named: .darkAqua)
         trigger.backgroundColor = .clear
         trigger.isOpaque = false
         trigger.hasShadow = false
@@ -233,7 +256,7 @@ final class EdgeWindowManager: NSObject {
     }
 
     func hidePanel() {
-        guard isVisible else { return }
+        guard isVisible, !isPinned, !isModalPresenting else { return }
 
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: hideDelay, repeats: false) { [weak self] _ in
@@ -250,7 +273,7 @@ final class EdgeWindowManager: NSObject {
     }
 
     private func performHide() {
-        guard isVisible else { return }
+        guard isVisible, !isPinned, !isModalPresenting else { return }
         isVisible = false
 
         NSAnimationContext.runAnimationGroup { context in
@@ -264,7 +287,62 @@ final class EdgeWindowManager: NSObject {
         }
     }
 
-    // MARK: - Mouse Monitoring
+    // MARK: - Screen & Mouse Monitoring
+
+    private func observeScreenChanges() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.repositionTriggerWindow()
+                if self.isVisible {
+                    self.positionPanelVisible()
+                } else {
+                    self.positionPanelHidden()
+                }
+            }
+        }
+    }
+
+    private func repositionTriggerWindow() {
+        guard let triggerView, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let screenFrame = screen.visibleFrame
+        let triggerRect: NSRect
+        switch edge {
+        case .right:
+            triggerRect = NSRect(
+                x: screenFrame.maxX - triggerWidth,
+                y: screenFrame.midY - triggerHeight / 2,
+                width: triggerWidth,
+                height: triggerHeight
+            )
+        case .left:
+            triggerRect = NSRect(
+                x: screenFrame.minX,
+                y: screenFrame.midY - triggerHeight / 2,
+                width: triggerWidth,
+                height: triggerHeight
+            )
+        case .top:
+            triggerRect = NSRect(
+                x: screenFrame.midX - triggerHeight / 2,
+                y: screenFrame.maxY - triggerWidth,
+                width: triggerHeight,
+                height: triggerWidth
+            )
+        case .bottom:
+            triggerRect = NSRect(
+                x: screenFrame.midX - triggerHeight / 2,
+                y: screenFrame.minY,
+                width: triggerHeight,
+                height: triggerWidth
+            )
+        }
+        triggerView.setFrame(triggerRect, display: true)
+    }
 
     private func startMouseMonitoring() {
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
@@ -275,7 +353,7 @@ final class EdgeWindowManager: NSObject {
         }
 
         // Also monitor when mouse is over our own window
-        NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
             guard let self else { return event }
             Task { @MainActor in
                 self.handleMouseMove()
@@ -319,40 +397,55 @@ final class EdgeWindowManager: NSObject {
     }
 }
 
-// MARK: - TriggerIndicator
+// MARK: - TriggerIndicator (Frosted Edge Dock with Live Provider Quota Rings)
 
 struct TriggerIndicator: View {
     let edge: DockEdge
     @StateObject private var state = TriggerState.shared
+    @StateObject private var appState = AppState.shared
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                switch edge {
-                case .right:
-                    HStack {
-                        Spacer()
-                        TriggerCapsuleWithArrow(isHovered: state.isHovered, isVertical: true)
-                            .padding(.trailing, 1)
-                    }
-                case .left:
-                    HStack {
-                        TriggerCapsuleWithArrow(isHovered: state.isHovered, isVertical: true)
-                            .padding(.leading, 1)
-                        Spacer()
-                    }
-                case .top:
-                    VStack {
-                        TriggerCapsuleWithArrow(isHovered: state.isHovered, isVertical: false)
-                            .padding(.top, 1)
-                        Spacer()
-                    }
-                case .bottom:
-                    VStack {
-                        Spacer()
-                        TriggerCapsuleWithArrow(isHovered: state.isHovered, isVertical: false)
-                            .padding(.bottom, 1)
-                    }
+        ZStack {
+            switch edge {
+            case .right:
+                HStack {
+                    Spacer(minLength: 0)
+                    TriggerCapsuleWithArrow(
+                        isHovered: state.isHovered,
+                        isVertical: true,
+                        dashboard: appState.dashboard
+                    )
+                    .padding(.trailing, 2)
+                }
+            case .left:
+                HStack {
+                    TriggerCapsuleWithArrow(
+                        isHovered: state.isHovered,
+                        isVertical: true,
+                        dashboard: appState.dashboard
+                    )
+                    .padding(.leading, 2)
+                    Spacer(minLength: 0)
+                }
+            case .top:
+                VStack {
+                    TriggerCapsuleWithArrow(
+                        isHovered: state.isHovered,
+                        isVertical: false,
+                        dashboard: appState.dashboard
+                    )
+                    .padding(.top, 2)
+                    Spacer(minLength: 0)
+                }
+            case .bottom:
+                VStack {
+                    Spacer(minLength: 0)
+                    TriggerCapsuleWithArrow(
+                        isHovered: state.isHovered,
+                        isVertical: false,
+                        dashboard: appState.dashboard
+                    )
+                    .padding(.bottom, 2)
                 }
             }
         }
@@ -362,55 +455,148 @@ struct TriggerIndicator: View {
 private struct TriggerCapsuleWithArrow: View {
     let isHovered: Bool
     let isVertical: Bool
+    let dashboard: MultiAccountDashboard?
+
+    private var todayText: String {
+        NumberFormatterUtil.formatCompact(dashboard?.totalTodayTokens ?? 0)
+    }
 
     var body: some View {
         ZStack {
-            // Spec: #5E86FF main, highlight rgba(255,255,255,.55)
-            Capsule()
+            RoundedRectangle(cornerRadius: 21, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: isHovered
                             ? [
-                                Color(.sRGB, red: 0.369, green: 0.525, blue: 1.0),
-                                Color(.sRGB, red: 0.28, green: 0.44, blue: 0.95)
+                                Color(.sRGB, red: 0.25, green: 0.34, blue: 0.56).opacity(0.92),
+                                Color(.sRGB, red: 0.16, green: 0.22, blue: 0.40).opacity(0.94),
                             ]
                             : [
-                                Color(.sRGB, red: 0.40, green: 0.48, blue: 0.68).opacity(0.58),
-                                Color(.sRGB, red: 0.26, green: 0.34, blue: 0.54).opacity(0.50)
+                                Color(.sRGB, red: 0.20, green: 0.26, blue: 0.42).opacity(0.76),
+                                Color(.sRGB, red: 0.12, green: 0.16, blue: 0.28).opacity(0.80),
                             ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
-                .frame(width: isVertical ? 34 : 136, height: isVertical ? 136 : 34)
                 .overlay(
-                    Capsule()
+                    RoundedRectangle(cornerRadius: 21, style: .continuous)
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    .white.opacity(isHovered ? 0.55 : 0.30),
-                                    .white.opacity(0.0)
+                                    .white.opacity(isHovered ? 0.22 : 0.12),
+                                    .white.opacity(0.02),
                                 ],
                                 startPoint: .top,
                                 endPoint: .bottom
                             )
                         )
-                        .frame(width: isVertical ? 29 : 131, height: isVertical ? 131 : 29)
                 )
                 .overlay(
-                    Capsule()
-                        .stroke(.white.opacity(isHovered ? 0.50 : 0.18), lineWidth: 0.6)
+                    RoundedRectangle(cornerRadius: 21, style: .continuous)
+                        .stroke(.white.opacity(isHovered ? 0.42 : 0.18), lineWidth: 0.7)
                 )
-                .shadow(color: .black.opacity(isHovered ? 0.20 : 0.12), radius: 3, x: 0, y: 1)
+                .shadow(color: .black.opacity(isHovered ? 0.28 : 0.16), radius: 6, x: 0, y: 2)
                 .shadow(
-                    color: Color(.sRGB, red: 0.357, green: 0.522, blue: 1.0).opacity(isHovered ? 0.72 : 0.16),
-                    radius: isHovered ? 20 : 8
+                    color: Color(.sRGB, red: 0.357, green: 0.522, blue: 1.0).opacity(isHovered ? 0.48 : 0.10),
+                    radius: isHovered ? 14 : 5
                 )
 
-            Image(systemName: isVertical ? "chevron.left" : "chevron.down")
-                .font(.system(size: isVertical ? 20 : 18, weight: .bold))
-                .foregroundStyle(.white.opacity(isHovered ? 0.92 : 0.54))
+            if isVertical {
+                VStack(spacing: 5.5) {
+                    VStack(spacing: 0.5) {
+                        Text("TODAY")
+                            .font(.system(size: 6.5, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.46))
+                        Text(todayText)
+                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.94))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                    .padding(.horizontal, 3)
+
+                    Rectangle()
+                        .fill(.white.opacity(0.14))
+                        .frame(width: 24, height: 0.7)
+
+                    VStack(spacing: 5.5) {
+                        ForEach(TrackedProvider.allCases) { provider in
+                            let group = dashboard?.providers.first { $0.provider == provider }
+                            EdgeDockProviderGauge(provider: provider, group: group)
+                        }
+                    }
+
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white.opacity(isHovered ? 0.90 : 0.45))
+                        .padding(.top, 1)
+                }
+                .padding(.vertical, 9)
+            } else {
+                HStack(spacing: 6) {
+                    Text(todayText)
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.92))
+                    ForEach(TrackedProvider.allCases) { provider in
+                        let group = dashboard?.providers.first { $0.provider == provider }
+                        EdgeDockProviderGauge(provider: provider, group: group)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
         }
+        .frame(width: isVertical ? 42 : 224, height: isVertical ? 224 : 42)
+    }
+}
+
+private struct EdgeDockProviderGauge: View {
+    let provider: TrackedProvider
+    let group: ProviderGroupSnapshot?
+
+    private var remainingPercent: Double? {
+        group?.representativeRemainingPercent
+    }
+
+    private var hasAnyActivity: Bool {
+        guard let group else { return false }
+        return !group.accounts.isEmpty || group.allTimeTokens > 0
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(.white.opacity(hasAnyActivity ? 0.15 : 0.08), lineWidth: 2.1)
+
+            if let rem = remainingPercent {
+                if rem <= 0 {
+                    Circle()
+                        .stroke(Color(.sRGB, red: 1.0, green: 0.36, blue: 0.36).opacity(0.55), lineWidth: 2.1)
+                } else {
+                    Circle()
+                        .trim(from: 0, to: min(1.0, max(0.03, rem / 100.0)))
+                        .stroke(
+                            ringColor(for: rem),
+                            style: StrokeStyle(lineWidth: 2.1, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+
+            ProviderBrandIcon(provider: provider, size: 12.5, cornerRadius: 3)
+                .opacity(hasAnyActivity ? 0.96 : 0.42)
+        }
+        .frame(width: 24, height: 24)
+    }
+
+    private func ringColor(for remaining: Double) -> Color {
+        if remaining <= 15 {
+            return Color(.sRGB, red: 1.0, green: 0.40, blue: 0.38)
+        }
+        if remaining <= 35 {
+            return Color(.sRGB, red: 1.0, green: 0.72, blue: 0.28)
+        }
+        return Color(.sRGB, red: 0.34, green: 0.90, blue: 0.66)
     }
 }
 

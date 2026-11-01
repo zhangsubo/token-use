@@ -1,12 +1,20 @@
 import Foundation
 
 enum DebugLogger {
-    // 设置为 false 可禁用调试日志（生产环境）
-    static let enabled = true
+    static let enabled: Bool = {
+        if ProcessInfo.processInfo.environment["TOKENUSE_DEBUG"] == "1" {
+            return true
+        }
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }()
 
     private static let logFile: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent("Applications/token-use/debug.log")
+        return home.appendingPathComponent("Library/Logs/TokenUse/debug.log")
     }()
 
     static func log(_ message: String) {

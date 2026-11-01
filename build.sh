@@ -3,7 +3,7 @@
 # TokenUse.app 打包脚本
 #
 # 输入 env:
-#   MARKETING_VERSION  默认 0.1.0    （CFBundleShortVersionString，对应 git tag v*.*.*）
+#   MARKETING_VERSION  默认 1.0.0    （CFBundleShortVersionString，对应 git tag v*.*.*）
 #   BUILD_NUMBER       默认 1        （CFBundleVersion，对应 GitHub Actions run_number）
 #
 # 产物：
@@ -13,13 +13,12 @@
 set -euo pipefail
 
 APP_NAME="TokenUse"
-BUILD_DIR=".build/arm64-apple-macosx/release"
 APP_BUNDLE="$APP_NAME.app"
 RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 ZIP_NAME="${APP_NAME}.zip"
 PROJECT_DIR="$(pwd -P)"
 
-MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"
+MARKETING_VERSION="${MARKETING_VERSION:-1.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache-physical"
@@ -28,6 +27,8 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFTPM_CACHE_PATH"
 
 echo "==> Building TokenUse (version $MARKETING_VERSION, build $BUILD_NUMBER)..."
 swift build -c release --disable-sandbox
+BUILD_DIR="$(swift build -c release --disable-sandbox --show-bin-path)"
+echo "==> Resolved binary path: $BUILD_DIR"
 
 echo "==> Assembling .app bundle..."
 rm -rf "$APP_BUNDLE"

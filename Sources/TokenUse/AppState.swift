@@ -2,185 +2,338 @@ import SwiftUI
 import Combine
 
 // MARK: - AppState
-/// 全局应用状态管理
-/// 职责：
-/// - 智能缓存策略（1小时有效期）：缓存有效时立即加载，后台更新今日数据
-/// - 定时刷新（默认 30 分钟，可在设置中调整）
-/// - 协调 NativeUsageService 和 ReportManager 的数据流
+/// 全局应用状态管理（@MainActor）
+/// - 启动秒开：存在有效快照时立即渲染（不清空今日数据），随后后台静默同步最新配额与日志
+/// - 主动刷新与定时刷新：始终执行真实扫描与在线配额拉取（修复原 1 小时内刷新无效与今日闪零问题）
+/// - 协调 AccountDiscoveryService、NativeUsageService、ProviderQuotaService 与 ReportManager
 
 @MainActor
 final class AppState: ObservableObject {
     static let shared = AppState()
 
+    @Published var dashboard: MultiAccountDashboard?
     @Published var stats: TokenStats?
+    @Published var discoveredAccounts: [ProviderAccountConfig] = []
+    @Published var activeCodexAccountIds: Set<String> = []
+    @Published var switchingAccountId: String? = nil
     @Published var errorMessage: String?
-    @Published var statusMessage: String = "Initializing..."
+    @Published var statusMessage: String = "正在初始化..."
     @Published var isLoading: Bool = false
 
     private let nativeUsageService = NativeUsageService.shared
+    private let quotaService = ProviderQuotaService.shared
     private let reportManager = ReportManager.shared
+
     private var timer: Timer?
-    private var hasCheckedInstall = false
+    private var hasStarted = false
+    private let dashboardCacheFilename = "dashboard-v3.json"
 
     private init() {}
 
     func start() async {
-        guard !hasCheckedInstall else { return }
-        hasCheckedInstall = true
+        guard !hasStarted else { return }
+        hasStarted = true
 
-        DebugLogger.log("🚀 [AppState] start() 被调用")
-        await fetchData()
-        startTimer()
-        DebugLogger.log("🚀 [AppState] start() 完成")
-    }
+        DebugLogger.log("🚀 [AppState] start() 开始")
+        reloadAccountList()
 
-    func refresh() async {
-        await fetchData()
-    }
-
-    private func fetchData() async {
-        isLoading = true
-        statusMessage = "Fetching data..."
-        errorMessage = nil
-
-        DebugLogger.log("📊 [AppState] 开始获取数据...")
-
-        // 智能缓存策略：如果缓存有效，立即加载并后台更新
-        let isCacheValid = await reportManager.isCacheValid()
-        if isCacheValid, let cachedReport = await reportManager.loadLatestReport() {
-            DebugLogger.log("✅ [AppState] 缓存有效，立即加载缓存数据")
-            // 立即显示缓存数据
-            self.stats = TokenStats(
-                allTime: cachedReport,
-                today: TokscaleReport(
-                    groupBy: "client,model",
-                    entries: [],
-                    totalInput: 0,
-                    totalOutput: 0,
-                    totalCacheRead: 0,
-                    totalCacheWrite: 0,
-                    totalReasoning: 0,
-                    totalMessages: 0,
-                    totalCost: 0
-                ),
-                updatedAt: Date()
-            )
-            statusMessage = "Loaded from cache"
-            isLoading = false
-
-            // 后台异步更新今日数据
-            DebugLogger.log("📊 [AppState] 后台更新今日数据...")
+        // 1. 若有 1 小时内的多账号快照，先瞬时展示（保留缓存中的今日数据与配额，绝不置零闪烁），再后台刷新
+        if let cached = await reportManager.loadSnapshot(
+            MultiAccountDashboard.self,
+            filename: dashboardCacheFilename,
+            maxAge: 3600
+        ) {
+            self.dashboard = cached
+            statusMessage = "已加载缓存，正在同步最新配额..."
+            startTimer()
             Task {
-                await updateTodayData()
+                await performSync(showBlockingSpinner: false)
             }
             return
         }
 
-        DebugLogger.log("📊 [AppState] 缓存无效或不存在，执行完整扫描...")
-
-        // 使用原生服务同时获取全量和今日数据
-        async let allTimeResult: Result<TokscaleReport, Error> = {
-            DebugLogger.log("📊 [AppState] 开始获取全量数据...")
-            do {
-                let report = try await self.nativeUsageService.fetchAllTime()
-                DebugLogger.log("📊 [AppState] 全量数据获取成功: \(report.entries.count) entries")
-                return .success(report)
-            }
-            catch {
-                DebugLogger.log("❌ [AppState] 全量数据获取失败: \(error)")
-                return .failure(error)
-            }
-        }()
-
-        async let todayResult: Result<TokscaleReport, Error> = {
-            DebugLogger.log("📊 [AppState] 开始获取今日数据...")
-            do {
-                let report = try await self.nativeUsageService.fetchToday()
-                DebugLogger.log("📊 [AppState] 今日数据获取成功: \(report.entries.count) entries")
-                return .success(report)
-            }
-            catch {
-                DebugLogger.log("❌ [AppState] 今日数据获取失败: \(error)")
-                return .failure(error)
-            }
-        }()
-
-        DebugLogger.log("📊 [AppState] 等待数据获取完成...")
-        let allTimeOutcome = await allTimeResult
-        let todayOutcome = await todayResult
-        DebugLogger.log("📊 [AppState] 数据获取完成")
-
-        let allTime: TokscaleReport? = {
-            if case .success(let r) = allTimeOutcome { return r } else { return nil }
-        }()
-        let today: TokscaleReport? = {
-            if case .success(let r) = todayOutcome { return r } else { return nil }
-        }()
-
-        DebugLogger.log("📊 [AppState] allTime: \(allTime != nil ? "存在" : "nil"), today: \(today != nil ? "存在" : "nil")")
-
-        // 保存全量报告作为缓存
-        if let allTime {
-            DebugLogger.log("📊 [AppState] 保存全量报告到缓存...")
-            if let data = try? JSONEncoder().encode(allTime) {
-                _ = try? await reportManager.saveReport(data)
-                DebugLogger.log("📊 [AppState] 缓存保存成功")
-            }
-        }
-
-        // 使用缓存的全量数据作为兜底
-        DebugLogger.log("📊 [AppState] 检查是否需要从缓存加载...")
-        let finalAllTime: TokscaleReport?
-        if let allTime {
-            finalAllTime = allTime
-            DebugLogger.log("📊 [AppState] 使用实时全量数据")
-        } else {
-            DebugLogger.log("📊 [AppState] 从缓存加载全量数据...")
-            finalAllTime = await reportManager.loadLatestReport()
-            DebugLogger.log("📊 [AppState] 缓存加载结果: \(finalAllTime != nil ? "成功" : "失败")")
-        }
-
-        if let finalAllTime {
-            DebugLogger.log("📊 [AppState] 构建 TokenStats...")
-            self.stats = TokenStats(
-                allTime: finalAllTime,
-                today: today ?? TokscaleReport(
-                    groupBy: "client,model",
-                    entries: [],
-                    totalInput: 0,
-                    totalOutput: 0,
-                    totalCacheRead: 0,
-                    totalCacheWrite: 0,
-                    totalReasoning: 0,
-                    totalMessages: 0,
-                    totalCost: 0
-                ),
-                updatedAt: Date()
-            )
-            statusMessage = "Updated at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
-            DebugLogger.log("✅ [AppState] 数据更新成功")
-        } else {
-            DebugLogger.log("❌ [AppState] 无可用数据")
-            self.errorMessage = "无法获取数据，请检查本地日志是否存在。"
-            statusMessage = "No data available"
-        }
-
-        // 如果今日数据获取失败，告知用户
-        if finalAllTime != nil, today == nil, case .failure(let err) = todayOutcome {
-            DebugLogger.log("⚠️ [AppState] 今日数据失败但全量数据成功: \(err.localizedDescription)")
-            self.errorMessage = "今日数据获取失败：\(err.localizedDescription)"
-        }
-
-        isLoading = false
-        DebugLogger.log("📊 [AppState] fetchData 完成")
+        await performSync(showBlockingSpinner: true)
+        startTimer()
     }
+
+    /// 手动点击刷新或设置变更后调用：强制执行完整本地扫描 + 在线配额查询
+    func refresh() async {
+        reloadAccountList()
+        await performSync(showBlockingSpinner: dashboard == nil)
+    }
+
+    /// 一键切换本机 `$CODEX_HOME/auth.json` 当前活跃的 Codex OAuth 账号
+    func switchActiveCodexAccount(_ accountId: String) async {
+        guard switchingAccountId == nil else { return }
+        switchingAccountId = accountId
+        errorMessage = nil
+        statusMessage = "正在切换系统活跃 Codex 账号..."
+        defer { switchingAccountId = nil }
+
+        let settings = SettingsManager.shared
+        let bundle = AccountDiscoveryService.resolveAccounts(
+            manualAccounts: settings.manualAccounts,
+            overrides: settings.accountOverrides,
+            enableAutoDiscovery: settings.enableAutoDiscovery
+        )
+        guard let target = bundle.allAccounts.first(where: { $0.id == accountId }) else {
+            errorMessage = "未找到目标 Codex 账号"
+            return
+        }
+
+        do {
+            try await CodexAccountSwitchService.switchActiveSystemAccount(to: target)
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = "切换 Codex 账号失败"
+        }
+    }
+
+    /// 仅重新扫描本机账号列表（供设置页即时反馈使用）
+    func reloadAccountList() {
+        let settings = SettingsManager.shared
+        let bundle = AccountDiscoveryService.resolveAccounts(
+            manualAccounts: settings.manualAccounts,
+            overrides: settings.accountOverrides,
+            enableAutoDiscovery: settings.enableAutoDiscovery
+        )
+        self.discoveredAccounts = bundle.allAccounts
+        self.activeCodexAccountIds = bundle.activeCodexAccountIds
+    }
+
+    private func performSync(showBlockingSpinner: Bool) async {
+        isLoading = true
+        if showBlockingSpinner {
+            statusMessage = "正在扫描本地日志与同步各账号配额..."
+        }
+        errorMessage = nil
+
+        let settings = SettingsManager.shared
+        let manualAccounts = settings.manualAccounts
+        let overrides = settings.accountOverrides
+        let autoEnabled = settings.enableAutoDiscovery
+
+        // 在后台并发拉取账户发现、本地日志单遍扫描、在线配额接口
+        let bundle = await Task.detached(priority: .userInitiated) {
+            AccountDiscoveryService.resolveAccounts(
+                manualAccounts: manualAccounts,
+                overrides: overrides,
+                enableAutoDiscovery: autoEnabled
+            )
+        }.value
+
+        self.discoveredAccounts = bundle.allAccounts
+        self.activeCodexAccountIds = bundle.activeCodexAccountIds
+        let enabledAccounts = bundle.enabledAccounts
+
+        let dynamicModels = await quotaService.modelMapForAntigravity()
+        let localUsage = await nativeUsageService.fetchCombined(
+            accounts: enabledAccounts,
+            dynamicAntigravityModels: dynamicModels
+        )
+
+        let quotaResults = await quotaService.fetchAllQuotas(
+            accounts: enabledAccounts,
+            ephemeralSecrets: bundle.ephemeralSecrets,
+            offlineCodexSnapshots: localUsage.offlineCodexSnapshots
+        )
+
+        let now = Date()
+        let builtDashboard = buildDashboard(
+            enabledAccounts: enabledAccounts,
+            activeCodexAccountIds: bundle.activeCodexAccountIds,
+            localUsage: localUsage,
+            quotaResults: quotaResults,
+            updatedAt: now
+        )
+
+        self.dashboard = builtDashboard
+        self.stats = TokenStats(
+            allTime: localUsage.allTimeReport,
+            today: localUsage.todayReport,
+            updatedAt: now
+        )
+
+        // 异步持久化快照与全量报告缓存
+        if let allTimeData = try? JSONEncoder().encode(localUsage.allTimeReport) {
+            _ = try? await reportManager.saveReport(allTimeData)
+        }
+        try? await reportManager.saveSnapshot(builtDashboard, filename: dashboardCacheFilename)
+
+        let timeStr = DateFormatter.localizedString(from: now, dateStyle: .none, timeStyle: .short)
+        statusMessage = "更新于 \(timeStr)"
+        isLoading = false
+        DebugLogger.log("✅ [AppState] 同步完成: \(builtDashboard.totalActiveAccounts) 个活跃账号")
+    }
+
+    private func buildDashboard(
+        enabledAccounts: [ProviderAccountConfig],
+        activeCodexAccountIds: Set<String>,
+        localUsage: CombinedLocalUsageResult,
+        quotaResults: [String: ProviderQuotaResult],
+        updatedAt: Date
+    ) -> MultiAccountDashboard {
+        var providerGroups: [ProviderGroupSnapshot] = []
+        var grandTodayBreakdown = TokenBreakdownSnapshot()
+        var grandAllTimeBreakdown = TokenBreakdownSnapshot()
+
+        for provider in TrackedProvider.allCases {
+            let pAccounts = enabledAccounts.filter { $0.provider == provider }
+            var snapshots: [AccountUsageSnapshot] = []
+            var seenExternalIndex: [String: Int] = [:]
+
+            for acct in pAccounts {
+                let q = quotaResults[acct.id]
+                let acctToday = localUsage.perAccountToday[acct.id] ?? UsageTotals()
+                let acctAllTime = localUsage.perAccountAllTime[acct.id] ?? UsageTotals()
+                let isActiveSystem = (provider == .codex) && activeCodexAccountIds.contains(acct.id)
+                let canSwitchSystem = (provider == .codex) && (acct.authKind == .oauthToken) && !isActiveSystem
+
+                let effectiveLabel: String = {
+                    // 若用户没有自定义改名且账号处于默认目录名，可用接口返回的昵称/邮箱美化
+                    let hasOverrideLabel = SettingsManager.shared.accountOverrides[acct.id]?.customLabel != nil
+                    if acct.source == .autoDiscovered, !hasOverrideLabel,
+                       let resolved = q?.resolvedLabel, !resolved.isEmpty,
+                       (acct.label.hasPrefix("Kimi Code (")
+                        || acct.label.hasPrefix("Xiaomi MiMo")
+                        || acct.label.contains("本机")) {
+                        return resolved
+                    }
+                    return acct.label
+                }()
+
+                let sourceBadge = acct.originDescription ?? (acct.source == .manual ? "手动添加" : "自动发现")
+                let dedupExternalKey = (q?.resolvedExternalId ?? acct.externalAccountId)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+
+                // 若两个自动发现账号指向同一个远端账号 ID（例如 ~/.kimi 与 ~/.kimi-code 同登录），自动合并本地 Token 防止重复卡片
+                if acct.source == .autoDiscovered,
+                   let key = dedupExternalKey, !key.isEmpty,
+                   let existingIdx = seenExternalIndex[key] {
+                    snapshots[existingIdx].todayTokens += acctToday.tokens
+                    snapshots[existingIdx].todayCost += acctToday.cost
+                    snapshots[existingIdx].allTimeTokens += acctAllTime.tokens
+                    snapshots[existingIdx].allTimeCost += acctAllTime.cost
+
+                    if acctToday.tokens > 0 {
+                        var mergedToday = snapshots[existingIdx].todayBreakdown ?? TokenBreakdownSnapshot()
+                        mergedToday.merge(acctToday.breakdown)
+                        snapshots[existingIdx].todayBreakdown = mergedToday
+                    }
+                    if acctAllTime.tokens > 0 {
+                        var mergedAll = snapshots[existingIdx].allTimeBreakdown ?? TokenBreakdownSnapshot()
+                        mergedAll.merge(acctAllTime.breakdown)
+                        snapshots[existingIdx].allTimeBreakdown = mergedAll
+                    }
+
+                    let mergedActive = snapshots[existingIdx].isActiveSystemAccount || isActiveSystem
+                    snapshots[existingIdx].isActiveSystemAccount = mergedActive
+                    if provider == .codex {
+                        snapshots[existingIdx].canSwitchSystemAccount = !mergedActive
+                            && (snapshots[existingIdx].canSwitchSystemAccount || acct.authKind == .oauthToken)
+                    }
+
+                    if snapshots[existingIdx].quotaWindows.isEmpty, let wins = q?.windows, !wins.isEmpty {
+                        snapshots[existingIdx].quotaWindows = wins
+                    }
+                    if snapshots[existingIdx].planBadge == nil {
+                        snapshots[existingIdx].planBadge = q?.planBadge
+                    }
+                    if snapshots[existingIdx].walletBalanceText == nil {
+                        snapshots[existingIdx].walletBalanceText = q?.walletBalanceText
+                    }
+                    if snapshots[existingIdx].resetCreditsText == nil {
+                        snapshots[existingIdx].resetCreditsText = q?.resetCreditsText
+                    }
+                    continue
+                }
+
+                let snap = AccountUsageSnapshot(
+                    id: acct.id,
+                    provider: provider,
+                    label: effectiveLabel,
+                    sourceBadge: sourceBadge,
+                    planBadge: q?.planBadge,
+                    quotaWindows: q?.windows ?? [],
+                    quotaStatusMessage: q?.statusMessage,
+                    quotaError: q?.errorMessage,
+                    hasCustomConsoleAuth: q?.hasCustomConsoleAuth ?? false,
+                    isActiveSystemAccount: isActiveSystem,
+                    canSwitchSystemAccount: canSwitchSystem,
+                    walletBalanceText: q?.walletBalanceText,
+                    resetCreditsText: q?.resetCreditsText,
+                    todayTokens: acctToday.tokens,
+                    todayCost: acctToday.cost,
+                    allTimeTokens: acctAllTime.tokens,
+                    allTimeCost: acctAllTime.cost,
+                    todayBreakdown: acctToday.tokens > 0 ? acctToday.breakdown : nil,
+                    allTimeBreakdown: acctAllTime.tokens > 0 ? acctAllTime.breakdown : nil,
+                    updatedAt: updatedAt
+                )
+                if acct.source == .autoDiscovered, let key = dedupExternalKey, !key.isEmpty {
+                    seenExternalIndex[key] = snapshots.count
+                }
+                snapshots.append(snap)
+            }
+
+            // 若已存在活跃的 ~/.kimi-code (v2) 账号，且旧版遗留 ~/.kimi (v1) 90 天内无任何日志且凭证已失效，默认隐藏废弃幽灵卡片（除非用户显式开启）
+            if provider == .kimi,
+               snapshots.contains(where: { !$0.quotaWindows.isEmpty }) {
+                snapshots.removeAll { snap in
+                    let explicitOverride = SettingsManager.shared.accountOverrides[snap.id]?.isEnabled == true
+                    return !explicitOverride
+                        && snap.sourceBadge == "~/.kimi"
+                        && snap.todayTokens == 0
+                        && snap.allTimeTokens == 0
+                        && snap.quotaWindows.isEmpty
+                        && snap.quotaError != nil
+                }
+            }
+
+            let providerToday = localUsage.perProviderToday[provider] ?? UsageTotals()
+            let providerAllTime = localUsage.perProviderAllTime[provider] ?? UsageTotals()
+            grandTodayBreakdown.merge(providerToday.breakdown)
+            grandAllTimeBreakdown.merge(providerAllTime.breakdown)
+
+            providerGroups.append(ProviderGroupSnapshot(
+                provider: provider,
+                accounts: snapshots,
+                todayTokens: providerToday.tokens,
+                todayCost: providerToday.cost,
+                allTimeTokens: providerAllTime.tokens,
+                allTimeCost: providerAllTime.cost,
+                todayBreakdown: providerToday.tokens > 0 ? providerToday.breakdown : nil,
+                allTimeBreakdown: providerAllTime.tokens > 0 ? providerAllTime.breakdown : nil
+            ))
+        }
+
+        let totalTodayTokens = providerGroups.reduce(0) { $0 + $1.todayTokens }
+        let totalTodayCost = providerGroups.reduce(0.0) { $0 + $1.todayCost }
+        let totalAllTimeTokens = providerGroups.reduce(0) { $0 + $1.allTimeTokens }
+        let totalAllTimeCost = providerGroups.reduce(0.0) { $0 + $1.totalAllTimeCostFragment }
+
+        return MultiAccountDashboard(
+            providers: providerGroups,
+            totalTodayTokens: totalTodayTokens,
+            totalTodayCost: totalTodayCost,
+            totalAllTimeTokens: totalAllTimeTokens,
+            totalAllTimeCost: totalAllTimeCost,
+            totalTodayBreakdown: totalTodayTokens > 0 ? grandTodayBreakdown : nil,
+            totalAllTimeBreakdown: totalAllTimeTokens > 0 ? grandAllTimeBreakdown : nil,
+            updatedAt: updatedAt
+        )
+    }
+
+    // MARK: - Timer
 
     private func startTimer() {
         timer?.invalidate()
         let interval = SettingsManager.shared.refreshInterval
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                await self?.fetchData()
+                await self?.refresh()
             }
         }
     }
@@ -188,24 +341,8 @@ final class AppState: ObservableObject {
     func restartTimer() {
         startTimer()
     }
+}
 
-    /// 后台更新今日数据（当使用缓存时调用）
-    private func updateTodayData() async {
-        do {
-            let todayReport = try await nativeUsageService.fetchToday()
-            DebugLogger.log("✅ [AppState] 今日数据后台更新成功: \(todayReport.entries.count) entries")
-
-            // 更新 stats 中的今日数据
-            if let currentStats = stats {
-                self.stats = TokenStats(
-                    allTime: currentStats.allTime,
-                    today: todayReport,
-                    updatedAt: Date()
-                )
-                statusMessage = "Updated at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
-            }
-        } catch {
-            DebugLogger.log("❌ [AppState] 今日数据后台更新失败: \(error)")
-        }
-    }
+private extension ProviderGroupSnapshot {
+    var totalAllTimeCostFragment: Double { allTimeCost }
 }

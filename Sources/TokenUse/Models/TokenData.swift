@@ -12,6 +12,7 @@ struct TokscaleEntry: Codable, Sendable {
     let reasoning: Int
     let messageCount: Int
     let cost: Double
+    var accountId: String? = nil
 
     var totalTokens: Int {
         input + output + cacheRead + cacheWrite + reasoning
@@ -109,6 +110,21 @@ enum NumberFormatterUtil {
             formatter.numberStyle = .decimal
             formatter.groupingSeparator = ","
             return formatter.string(from: NSNumber(value: num)) ?? "\(num)"
+        }
+    }
+
+    static func formatCompact(_ num: Int) -> String {
+        let absNum = abs(num)
+        if absNum >= 1_000_000 {
+            return format(num)
+        } else if absNum >= 1_000 {
+            let thousands = Double(num) / 1_000.0
+            if thousands >= 100 {
+                return String(format: "%.0f K", thousands)
+            }
+            return String(format: "%.1f K", thousands)
+        } else {
+            return "\(num)"
         }
     }
 
