@@ -20,6 +20,7 @@ struct TokenDashboardContent: View {
     @ObservedObject var appState: AppState
     @ObservedObject private var edgeManager = EdgeWindowManager.shared
     @ObservedObject private var settings = SettingsManager.shared
+    @ObservedObject private var activityMonitor = SessionActivityMonitor.shared
 
     @State private var selectedProvider: TrackedProvider? = nil
     @State private var settingsLaunch: SettingsLaunchConfig? = nil
@@ -108,6 +109,8 @@ struct TokenDashboardContent: View {
                             ForEach(filteredGroups(from: dashboard)) { group in
                                 ProviderSectionCard(
                                     group: group,
+                                    isSessionActive: activityMonitor.activeProviders.contains(group.provider),
+                                    showEstimatedCost: settings.showEstimatedCost,
                                     switchingAccountId: appState.switchingAccountId,
                                     onAddAccount: {
                                         openSettings(tab: .accounts, adding: group.provider)
@@ -268,7 +271,7 @@ struct TokenDashboardContent: View {
                     systemName: "plus",
                     help: "添加平台账号"
                 ) {
-                    openSettings(tab: .accounts, adding: selectedProvider ?? .codex)
+                    openSettings(tab: .accounts, adding: selectedProvider ?? settings.providerOrder.first ?? .codex)
                 }
 
                 HeaderActionButton(
@@ -323,7 +326,7 @@ struct TokenDashboardContent: View {
                 icon: "sun.max.fill",
                 accent: Color(.sRGB, red: 0.38, green: 0.76, blue: 1.0),
                 tokensText: NumberFormatterUtil.format(dashboard.totalTodayTokens),
-                costText: NumberFormatterUtil.formatCurrency(dashboard.totalTodayCost),
+                costText: settings.showEstimatedCost ? NumberFormatterUtil.formatCurrency(dashboard.totalTodayCost) : nil,
                 breakdown: dashboard.totalTodayBreakdown
             )
 
@@ -332,7 +335,7 @@ struct TokenDashboardContent: View {
                 icon: "chart.bar.xaxis",
                 accent: Color(.sRGB, red: 0.56, green: 0.88, blue: 0.68),
                 tokensText: NumberFormatterUtil.format(dashboard.totalAllTimeTokens),
-                costText: NumberFormatterUtil.formatCurrency(dashboard.totalAllTimeCost),
+                costText: settings.showEstimatedCost ? NumberFormatterUtil.formatCurrency(dashboard.totalAllTimeCost) : nil,
                 breakdown: dashboard.totalAllTimeBreakdown
             )
 
@@ -357,7 +360,7 @@ struct TokenDashboardContent: View {
                 }
             }
 
-            ForEach(TrackedProvider.allCases) { provider in
+            ForEach(settings.providerOrder) { provider in
                 let count = dashboard.providers.first(where: { $0.provider == provider })?.accounts.count ?? 0
                 FilterChipButton(
                     title: provider.shortName,
@@ -378,10 +381,13 @@ struct TokenDashboardContent: View {
     }
 
     private func filteredGroups(from dashboard: MultiAccountDashboard) -> [ProviderGroupSnapshot] {
-        guard let selectedProvider else {
-            return dashboard.providers
+        let ordered = settings.providerOrder.compactMap { provider in
+            dashboard.providers.first(where: { $0.provider == provider })
         }
-        return dashboard.providers.filter { $0.provider == selectedProvider }
+        guard let selectedProvider else {
+            return ordered
+        }
+        return ordered.filter { $0.provider == selectedProvider }
     }
 
     private func footerBar(updatedAt: Date) -> some View {
@@ -396,18 +402,24 @@ struct TokenDashboardContent: View {
 
             Spacer()
 
-            HStack(spacing: 4) {
-                Text("* 本地会话日志 + 在线套餐配额双轨统计 · 定价参考")
+            if settings.showEstimatedCost {
+                HStack(spacing: 4) {
+                    Text("* 本地会话日志 + 在线套餐配额双轨统计 · 定价参考")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.white.opacity(0.42))
+                    Text("LiteLLM")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.68))
+                        .onTapGesture {
+                            if let url = URL(string: "https://github.com/BerriAI/litellm") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                }
+            } else {
+                Text("* 本地会话日志 + 在线套餐配额双轨统计")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white.opacity(0.42))
-                Text("LiteLLM")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.68))
-                    .onTapGesture {
-                        if let url = URL(string: "https://github.com/BerriAI/litellm") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
             }
         }
         .padding(.horizontal, 12)
@@ -442,7 +454,7 @@ private struct CompactMetricCard: View {
     let icon: String
     let accent: Color
     let tokensText: String
-    let costText: String
+    let costText: String?
     let breakdown: TokenBreakdownSnapshot?
 
     var body: some View {
@@ -455,19 +467,22 @@ private struct CompactMetricCard: View {
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.68))
                 Spacer(minLength: 0)
-                Text(costText)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule()
-                            .fill(Color(.sRGB, red: 0.16, green: 0.56, blue: 0.38).opacity(0.32))
-                            .overlay(
-                                Capsule()
-                                    .stroke(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68).opacity(0.28), lineWidth: 0.6)
-                            )
-                    )
+                if let costText {
+                    Text(costText)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule()
+                                .fill(Color(.sRGB, red: 0.16, green: 0.56, blue: 0.38).opacity(0.32))
+                                .overlay(
+                                    Capsule()
+                                        .stroke(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68).opacity(0.28), lineWidth: 0.6)
+                                )
+                        )
+                        .help("按 API 单价折算等效价值")
+                }
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 5) {
@@ -567,6 +582,8 @@ private struct FilterChipButton: View {
 
 private struct ProviderSectionCard: View {
     let group: ProviderGroupSnapshot
+    let isSessionActive: Bool
+    let showEstimatedCost: Bool
     let switchingAccountId: String?
     let onAddAccount: () -> Void
     let onBindXiaomiCookie: (String) -> Void
@@ -575,24 +592,31 @@ private struct ProviderSectionCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             // Provider Header
-            HStack(spacing: 9) {
+            HStack(spacing: 8) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(group.provider.accentColor.opacity(0.18))
                         .frame(width: 28, height: 28)
                         .overlay(
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .stroke(group.provider.accentColor.opacity(0.45), lineWidth: 0.8)
+                                .stroke(
+                                    isSessionActive
+                                        ? Color(.sRGB, red: 0.34, green: 0.94, blue: 0.66).opacity(0.75)
+                                        : group.provider.accentColor.opacity(0.45),
+                                    lineWidth: isSessionActive ? 1.1 : 0.8
+                                )
                         )
 
                     ProviderBrandIcon(provider: group.provider, size: 18, cornerRadius: 4)
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         Text(group.provider.displayName)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .layoutPriority(2)
 
                         Text(group.provider.vendorName)
                             .font(.system(size: 10, weight: .medium))
@@ -600,6 +624,7 @@ private struct ProviderSectionCard: View {
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(.white.opacity(0.08)))
+                            .lineLimit(1)
 
                         Text("\(group.accounts.count) 账号")
                             .font(.system(size: 10, weight: .medium))
@@ -607,26 +632,76 @@ private struct ProviderSectionCard: View {
                             .padding(.horizontal, 6)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(group.provider.accentColor.opacity(0.15)))
+                            .lineLimit(1)
+
+                        if isSessionActive {
+                            HStack(spacing: 3.5) {
+                                Circle()
+                                    .fill(Color(.sRGB, red: 0.34, green: 0.94, blue: 0.66))
+                                    .frame(width: 5.5, height: 5.5)
+                                Text("运行中")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                            }
+                            .foregroundStyle(Color(.sRGB, red: 0.42, green: 0.95, blue: 0.70))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(
+                                Capsule()
+                                    .fill(Color(.sRGB, red: 0.16, green: 0.58, blue: 0.38).opacity(0.32))
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(Color(.sRGB, red: 0.42, green: 0.95, blue: 0.70).opacity(0.40), lineWidth: 0.6)
+                                    )
+                            )
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        }
                     }
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    if let tps = group.tokensPerSecond {
+                        HStack(spacing: 2.5) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 8.5, weight: .bold))
+                            Text(SpeedFormatter.format(tps))
+                                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        }
+                        .foregroundStyle(Color(.sRGB, red: 0.56, green: 0.88, blue: 1.0))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            Capsule()
+                                .fill(Color(.sRGB, red: 0.22, green: 0.58, blue: 0.90).opacity(0.18))
+                                .overlay(
+                                    Capsule()
+                                        .stroke(Color(.sRGB, red: 0.56, green: 0.88, blue: 1.0).opacity(0.32), lineWidth: 0.6)
+                                )
+                        )
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .help(SpeedFormatter.tooltip(average: tps, latest: group.latestTokensPerSecond, isToday: group.speedIsToday))
+                    }
+
                     if group.todayTokens > 0 || group.allTimeTokens > 0 {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 5) {
                             Text("今日 \(NumberFormatterUtil.formatCompact(group.todayTokens))")
                                 .foregroundStyle(.white.opacity(0.84))
                             Text("·")
                                 .foregroundStyle(.white.opacity(0.30))
                             Text("90d \(NumberFormatterUtil.formatCompact(group.allTimeTokens))")
                                 .foregroundStyle(.white.opacity(0.64))
-                            if group.allTimeCost > 0 {
+                            if showEstimatedCost && group.allTimeCost > 0 {
                                 Text(NumberFormatterUtil.formatCurrency(group.allTimeCost))
                                     .foregroundStyle(Color(.sRGB, red: 0.46, green: 0.92, blue: 0.68))
+                                    .help("按 API 单价折算等效价值")
                             }
                         }
                         .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
 
                     Button(action: onAddAccount) {
@@ -653,6 +728,7 @@ private struct ProviderSectionCard: View {
                         AccountQuotaCard(
                             account: account,
                             accent: group.provider.accentColor,
+                            showInlineSpeed: group.accounts.count > 1,
                             isSwitching: switchingAccountId == account.id,
                             onBindXiaomiCookie: { onBindXiaomiCookie(account.id) },
                             onSwitchCodexAccount: { onSwitchCodexAccount(account.id) }
@@ -720,6 +796,7 @@ private struct ProviderSectionCard: View {
 private struct AccountQuotaCard: View {
     let account: AccountUsageSnapshot
     let accent: Color
+    let showInlineSpeed: Bool
     let isSwitching: Bool
     let onBindXiaomiCookie: () -> Void
     let onSwitchCodexAccount: () -> Void
@@ -856,6 +933,19 @@ private struct AccountQuotaCard: View {
                     .help("打开隔离的小米控制台登录窗口，自动提取该账号 Cookie 查询 Token Plan 额度")
                 }
 
+                if showInlineSpeed, let acctTps = account.tokensPerSecond {
+                    HStack(spacing: 2) {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 8, weight: .bold))
+                        Text(SpeedFormatter.format(acctTps))
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                    }
+                    .foregroundStyle(Color(.sRGB, red: 0.56, green: 0.88, blue: 1.0).opacity(0.92))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .help(SpeedFormatter.tooltip(average: acctTps, latest: account.latestTokensPerSecond, isToday: account.speedIsToday))
+                }
+
                 if account.todayTokens > 0 || account.allTimeTokens > 0 {
                     Button {
                         withAnimation(.easeInOut(duration: 0.16)) {
@@ -934,7 +1024,7 @@ private struct AccountQuotaCard: View {
         breakdown: TokenBreakdownSnapshot,
         todayBreakdown: TokenBreakdownSnapshot?
     ) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             Text(String(format: "90d 缓存命中 %.1f%%", breakdown.cacheHitPercent))
                 .font(.system(size: 10, weight: .semibold, design: .rounded))
                 .foregroundStyle(Color(.sRGB, red: 0.46, green: 0.92, blue: 0.72))
@@ -950,6 +1040,12 @@ private struct AccountQuotaCard: View {
             }
 
             Spacer(minLength: 0)
+
+            if let acctTps = account.tokensPerSecond {
+                Text("⚡ \(SpeedFormatter.format(acctTps))")
+                    .foregroundStyle(Color(.sRGB, red: 0.56, green: 0.88, blue: 1.0))
+                    .help(SpeedFormatter.tooltip(average: acctTps, latest: account.latestTokensPerSecond, isToday: account.speedIsToday))
+            }
 
             if let tb = todayBreakdown, tb.totalTokens > 0 {
                 Text(String(format: "今日缓存 %.0f%%", tb.cacheHitPercent))

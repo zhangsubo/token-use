@@ -128,7 +128,20 @@ enum NumberFormatterUtil {
         }
     }
 
+    private static let currencyDecimalFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.groupingSeparator = ","
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+
     static func formatCurrency(_ value: Double) -> String {
-        String(format: "%.2f", value)
+        let formatted = currencyDecimalFormatter.string(from: NSNumber(value: value))
+            ?? String(format: "%.2f", value)
+        return "≈ $\(formatted)"
     }
 }

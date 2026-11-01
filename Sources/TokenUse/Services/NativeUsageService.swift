@@ -16,10 +16,61 @@ struct CombinedLocalUsageResult: Sendable {
     let offlineCodexSnapshots: [String: OfflineCodexRateLimit]
 }
 
+struct SpeedSampleAccumulator: Sendable, Codable, Equatable {
+    var timedOutputTokens: Int = 0
+    var timedDurationSeconds: Double = 0.0
+    var latestTimestamp: Date? = nil
+    var latestTokensPerSecond: Double? = nil
+
+    mutating func addSample(outputTokens: Int, durationSeconds: Double, timestamp: Date) {
+        guard outputTokens >= 8,
+              durationSeconds >= 0.15,
+              durationSeconds <= 600.0 else {
+            return
+        }
+        let rate = Double(outputTokens) / durationSeconds
+        guard rate >= 0.5 && rate <= 1500.0 else { return }
+
+        timedOutputTokens += outputTokens
+        timedDurationSeconds += durationSeconds
+        if let prevTs = latestTimestamp {
+            if timestamp >= prevTs {
+                latestTimestamp = timestamp
+                latestTokensPerSecond = rate
+            }
+        } else {
+            latestTimestamp = timestamp
+            latestTokensPerSecond = rate
+        }
+    }
+
+    mutating func merge(_ other: SpeedSampleAccumulator) {
+        timedOutputTokens += other.timedOutputTokens
+        timedDurationSeconds += other.timedDurationSeconds
+        if let otherTs = other.latestTimestamp, let otherRate = other.latestTokensPerSecond {
+            if let curTs = latestTimestamp {
+                if otherTs >= curTs {
+                    latestTimestamp = otherTs
+                    latestTokensPerSecond = otherRate
+                }
+            } else {
+                latestTimestamp = otherTs
+                latestTokensPerSecond = otherRate
+            }
+        }
+    }
+
+    var averageTokensPerSecond: Double? {
+        guard timedDurationSeconds >= 0.25, timedOutputTokens >= 8 else { return nil }
+        return Double(timedOutputTokens) / timedDurationSeconds
+    }
+}
+
 struct UsageTotals: Sendable, Codable, Equatable {
     var tokens: Int = 0
     var cost: Double = 0.0
     var breakdown: TokenBreakdownSnapshot = TokenBreakdownSnapshot()
+    var speed: SpeedSampleAccumulator = SpeedSampleAccumulator()
 
     mutating func add(
         input: Int,
@@ -27,7 +78,9 @@ struct UsageTotals: Sendable, Codable, Equatable {
         cacheRead: Int,
         cacheWrite: Int,
         reasoning: Int,
-        cost: Double
+        cost: Double,
+        durationSeconds: Double? = nil,
+        timestamp: Date? = nil
     ) {
         let total = input + output + cacheRead + cacheWrite + reasoning
         self.tokens += total
@@ -37,6 +90,13 @@ struct UsageTotals: Sendable, Codable, Equatable {
         self.breakdown.cacheRead += cacheRead
         self.breakdown.cacheWrite += cacheWrite
         self.breakdown.reasoning += reasoning
+        if let durationSeconds, let timestamp {
+            self.speed.addSample(
+                outputTokens: output + reasoning,
+                durationSeconds: durationSeconds,
+                timestamp: timestamp
+            )
+        }
     }
 }
 
@@ -45,11 +105,13 @@ actor NativeUsageService {
 
     private static let codexNeedles: [[UInt8]] = [
         Array("\"token_count\"".utf8),
+        Array("\"token_usage_record\"".utf8),
         Array("\"turn_context\"".utf8),
         Array("\"session_meta\"".utf8),
     ]
     private static let kimiNeedles: [[UInt8]] = [
         Array("\"usage.record\"".utf8),
+        Array("\"llm.request\"".utf8),
         Array("\"StatusUpdate\"".utf8),
     ]
     private static let assistantUsageNeedles: [[UInt8]] = [
@@ -195,6 +257,8 @@ actor NativeUsageService {
         var creatorChatGPTAccountId: String? = nil
         var currentModel: String = "codex-default"
         var lastTotalTokens: Int = -1
+        var llmRequestStart: Date? = nil
+        var pendingStepDuration: Double? = nil
 
         forEachJSONLLine(in: fileData, matchingAny: Self.codexNeedles) { lineData in
             guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -222,6 +286,19 @@ actor NativeUsageService {
                           let m = settings["model"] as? String, !m.isEmpty {
                     currentModel = m
                 }
+                llmRequestStart = parseISO(obj["timestamp"])
+                pendingStepDuration = nil
+                return
+            }
+
+            if type == "token_usage_record" {
+                if let endTs = parseISO(obj["timestamp"]),
+                   let startTs = llmRequestStart {
+                    let dt = endTs.timeIntervalSince(startTs)
+                    if dt >= 0.1 && dt <= 600.0 {
+                        pendingStepDuration = dt
+                    }
+                }
                 return
             }
 
@@ -244,6 +321,8 @@ actor NativeUsageService {
 
             guard state.allTimeInterval.contains(timestamp),
                   let info = payload["info"] as? [String: Any] else {
+                llmRequestStart = timestamp
+                pendingStepDuration = nil
                 return
             }
 
@@ -251,12 +330,20 @@ actor NativeUsageService {
             if let totalUsage = info["total_token_usage"] as? [String: Any] {
                 let sessionTotal = int(totalUsage["total_tokens"])
                 if sessionTotal > 0 && sessionTotal == lastTotalTokens {
+                    llmRequestStart = timestamp
                     return
                 }
                 if sessionTotal > 0 {
                     lastTotalTokens = sessionTotal
                 }
             }
+
+            let stepDuration: Double? = pendingStepDuration ?? llmRequestStart.flatMap { startTs in
+                let dt = timestamp.timeIntervalSince(startTs)
+                return (dt >= 0.1 && dt <= 180.0) ? dt : nil
+            }
+            pendingStepDuration = nil
+            llmRequestStart = timestamp
 
             // 仅读取单步增量 last_token_usage（绝不把累计 total_token_usage 当单步累加！）
             guard let usage = info["last_token_usage"] as? [String: Any] else { return }
@@ -297,7 +384,8 @@ actor NativeUsageService {
                 cacheRead: cacheRead,
                 cacheWrite: cacheWrite,
                 reasoning: reasoning,
-                cost: cost
+                cost: cost,
+                durationSeconds: stepDuration
             )
         }
     }
@@ -430,6 +518,11 @@ actor NativeUsageService {
                 let cacheRead = int(cache?["read"])
                 let cacheWrite = int(cache?["write"])
 
+                let timeObj = obj["time"] as? [String: Any]
+                let createdVal = double(timeObj?["created"]) > 0 ? double(timeObj?["created"]) : Double(createdMs)
+                let completedVal = double(timeObj?["completed"])
+                let stepDuration: Double? = completedVal > createdVal ? (completedVal - createdVal) / 1000.0 : nil
+
                 let rawCost = double(obj["cost"])
                 let cost = rawCost > 0 ? rawCost : PriceResolver.estimate(
                     model: modelId,
@@ -454,7 +547,8 @@ actor NativeUsageService {
                     cacheRead: cacheRead,
                     cacheWrite: cacheWrite,
                     reasoning: reasoning,
-                    cost: cost
+                    cost: cost,
+                    durationSeconds: stepDuration
                 )
             }
         }
@@ -503,20 +597,38 @@ actor NativeUsageService {
         state: inout DualScanState
     ) {
         guard let fileData = readMappedData(file) else { return }
+        var lastLLMRequestSec: Double? = nil
 
         forEachJSONLLine(in: fileData, matchingAny: Self.kimiNeedles) { lineData in
             guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
                 return
             }
 
-            if (obj["type"] as? String) == "usage.record" {
+            let entryType = obj["type"] as? String
+            if entryType == "llm.request" {
+                let t = double(obj["time"])
+                if t > 0 {
+                    lastLLMRequestSec = t > 1_000_000_000_000 ? t / 1000.0 : t
+                }
+                return
+            }
+
+            if entryType == "usage.record" {
                 // 跳过会话级汇总行，防止与单步 turn 记录叠加导致 2 倍重复计数
                 if (obj["usageScope"] as? String) == "session" {
                     return
                 }
                 let timeMs = double(obj["time"])
                 guard timeMs > 0 else { return }
-                let timestamp = Date(timeIntervalSince1970: timeMs > 1_000_000_000_000 ? timeMs / 1000.0 : timeMs)
+                let endSec = timeMs > 1_000_000_000_000 ? timeMs / 1000.0 : timeMs
+                let timestamp = Date(timeIntervalSince1970: endSec)
+                let stepDuration: Double? = {
+                    guard let startSec = lastLLMRequestSec else { return nil }
+                    let dt = endSec - startSec
+                    return (dt >= 0.1 && dt <= 600.0) ? dt : nil
+                }()
+                lastLLMRequestSec = nil
+
                 guard state.allTimeInterval.contains(timestamp),
                       let usage = obj["usage"] as? [String: Any] else { return }
 
@@ -550,7 +662,8 @@ actor NativeUsageService {
                     cacheRead: cacheRead,
                     cacheWrite: cacheWrite,
                     reasoning: 0,
-                    cost: cost
+                    cost: cost,
+                    durationSeconds: stepDuration
                 )
             } else if let timestamp = unixSecondsDate(obj["timestamp"]),
                       state.allTimeInterval.contains(timestamp),
@@ -673,15 +786,38 @@ actor NativeUsageService {
         state: inout DualScanState
     ) {
         guard let fileData = readMappedData(file) else { return }
+        let mcodeNeedles: [[UInt8]] = [
+            Array("\"assistant\"".utf8),
+            Array("\"user\"".utf8),
+        ]
+        var lastRequestTs: Date? = nil
 
-        forEachJSONLLine(in: fileData, matchingAll: Self.assistantUsageNeedles) { lineData in
+        forEachJSONLLine(in: fileData, matchingAny: mcodeNeedles) { lineData in
             guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
                 return
             }
 
             let msg = (obj["message"] as? [String: Any]) ?? obj
-            guard (msg["role"] as? String) == "assistant",
-                  let usage = msg["usage"] as? [String: Any] else {
+            let role = msg["role"] as? String
+
+            let tsAny = msg["timestamp"] ?? obj["timestamp"]
+            let timestamp: Date? = {
+                let numeric = double(tsAny)
+                if numeric > 0 {
+                    return Date(timeIntervalSince1970: numeric > 1_000_000_000_000 ? numeric / 1000.0 : numeric)
+                }
+                return parseISO(tsAny)
+            }()
+
+            if role == "user" {
+                if let timestamp { lastRequestTs = timestamp }
+                return
+            }
+
+            guard role == "assistant",
+                  let usage = msg["usage"] as? [String: Any],
+                  let timestamp,
+                  state.allTimeInterval.contains(timestamp) else {
                 return
             }
 
@@ -692,15 +828,21 @@ actor NativeUsageService {
                 guard seenMessageIds.insert(rawMsgId).inserted else { return }
             }
 
-            let tsAny = msg["timestamp"] ?? obj["timestamp"]
-            let timestamp: Date? = {
-                let numeric = double(tsAny)
-                if numeric > 0 {
-                    return Date(timeIntervalSince1970: numeric > 1_000_000_000_000 ? numeric / 1000.0 : numeric)
+            let stepDuration: Double? = {
+                let explicitMs = double(usage["durationMs"] ?? usage["duration_ms"] ?? msg["durationMs"] ?? obj["durationMs"])
+                if explicitMs > 0 { return explicitMs / 1000.0 }
+                if let timeObj = (msg["time"] as? [String: Any]) ?? (obj["time"] as? [String: Any]) {
+                    let c = double(timeObj["created"])
+                    let d = double(timeObj["completed"])
+                    if d > c && c > 0 { return (d - c) / 1000.0 }
                 }
-                return parseISO(tsAny)
+                if let startTs = lastRequestTs {
+                    let dt = timestamp.timeIntervalSince(startTs)
+                    if dt >= 0.1 && dt <= 300 { return dt }
+                }
+                return nil
             }()
-            guard let timestamp, state.allTimeInterval.contains(timestamp) else { return }
+            lastRequestTs = timestamp
 
             // Pi / MiniMax Code runtime 格式中 input 已不含 cacheRead；output 内部包含 reasoning
             let input = int(usage["input"] ?? usage["input_tokens"])
@@ -736,7 +878,8 @@ actor NativeUsageService {
                 cacheRead: cacheRead,
                 cacheWrite: cacheWrite,
                 reasoning: reasoning,
-                cost: cost
+                cost: cost,
+                durationSeconds: stepDuration
             )
         }
     }
@@ -894,6 +1037,11 @@ actor NativeUsageService {
         let cacheRead = int(cache?["read"])
         let cacheWrite = int(cache?["write"])
 
+        let timeObj = obj["time"] as? [String: Any]
+        let createdVal = double(timeObj?["created"]) > 0 ? double(timeObj?["created"]) : Double(createdMs)
+        let completedVal = double(timeObj?["completed"])
+        let stepDuration: Double? = completedVal > createdVal ? (completedVal - createdVal) / 1000.0 : nil
+
         let rawCost = double(obj["cost"])
         let cost = rawCost > 0 ? rawCost : PriceResolver.estimate(
             model: modelId,
@@ -917,7 +1065,8 @@ actor NativeUsageService {
             cacheRead: cacheRead,
             cacheWrite: cacheWrite,
             reasoning: reasoning,
-            cost: cost
+            cost: cost,
+            durationSeconds: stepDuration
         )
     }
 
@@ -928,6 +1077,10 @@ actor NativeUsageService {
         ]
         let cutoff = state.allTimeInterval.start.addingTimeInterval(-86_400)
         var scanned = Set<String>()
+        let claudeNeedles: [[UInt8]] = [
+            Array("\"assistant\"".utf8),
+            Array("\"user\"".utf8),
+        ]
 
         for root in roots where fileManager.fileExists(atPath: root.path) {
             for file in recentFiles(under: root, cutoff: cutoff, where: { $0.pathExtension == "jsonl" }) {
@@ -935,9 +1088,21 @@ actor NativeUsageService {
                 guard scanned.insert(canonical).inserted,
                       let fileData = readMappedData(file) else { continue }
 
-                forEachJSONLLine(in: fileData, matchingAll: Self.assistantUsageNeedles) { lineData in
+                var lastRequestTs: Date? = nil
+                forEachJSONLLine(in: fileData, matchingAny: claudeNeedles) { lineData in
                     guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                          (obj["type"] as? String) == "assistant",
+                          let entryType = obj["type"] as? String else {
+                        return
+                    }
+
+                    if entryType == "user" {
+                        if let ts = parseISO(obj["timestamp"]) {
+                            lastRequestTs = ts
+                        }
+                        return
+                    }
+
+                    guard entryType == "assistant",
                           let msg = obj["message"] as? [String: Any],
                           let model = msg["model"] as? String,
                           let tracked = TrackedProvider.classify(client: "claude", provider: "", model: model),
@@ -946,6 +1111,17 @@ actor NativeUsageService {
                           let usage = msg["usage"] as? [String: Any] else {
                         return
                     }
+
+                    let durMs = double(obj["durationMs"] ?? msg["durationMs"])
+                    let stepDuration: Double? = {
+                        if durMs > 0 { return durMs / 1000.0 }
+                        if let startTs = lastRequestTs {
+                            let dt = timestamp.timeIntervalSince(startTs)
+                            if dt >= 0.1 && dt <= 300 { return dt }
+                        }
+                        return nil
+                    }()
+                    lastRequestTs = timestamp
 
                     let input = int(usage["input_tokens"])
                     let output = int(usage["output_tokens"])
@@ -976,13 +1152,16 @@ actor NativeUsageService {
                         output: output,
                         cacheRead: cacheRead,
                         cacheWrite: cacheWrite,
-                        reasoning: 0,
-                        cost: cost
+                        reasoning: reasoningZero,
+                        cost: cost,
+                        durationSeconds: stepDuration
                     )
                 }
             }
         }
     }
+
+    private var reasoningZero: Int { 0 }
 
     // MARK: - 5. Google Antigravity Scanner (conversations/*.db Protobuf + transcript.jsonl 回退)
 
@@ -1124,7 +1303,8 @@ actor NativeUsageService {
                 cacheRead: stepUsage.cacheReadTokens,
                 cacheWrite: stepUsage.cacheCreationTokens,
                 reasoning: reasoning,
-                cost: cost
+                cost: cost,
+                durationSeconds: stepUsage.durationSeconds
             )
         }
     }
@@ -1379,7 +1559,8 @@ private struct DualScanState {
         cacheRead: Int,
         cacheWrite: Int,
         reasoning: Int,
-        cost: Double
+        cost: Double,
+        durationSeconds: Double? = nil
     ) {
         let total = input + output + cacheRead + cacheWrite + reasoning
         guard total > 0 else { return }
@@ -1418,7 +1599,9 @@ private struct DualScanState {
             cacheRead: cacheRead,
             cacheWrite: cacheWrite,
             reasoning: reasoning,
-            cost: cost
+            cost: cost,
+            durationSeconds: durationSeconds,
+            timestamp: timestamp
         )
         if let effectiveAccountId {
             perAccountAllTime[effectiveAccountId, default: UsageTotals()].add(
@@ -1427,7 +1610,9 @@ private struct DualScanState {
                 cacheRead: cacheRead,
                 cacheWrite: cacheWrite,
                 reasoning: reasoning,
-                cost: cost
+                cost: cost,
+                durationSeconds: durationSeconds,
+                timestamp: timestamp
             )
         }
 
@@ -1451,7 +1636,9 @@ private struct DualScanState {
                 cacheRead: cacheRead,
                 cacheWrite: cacheWrite,
                 reasoning: reasoning,
-                cost: cost
+                cost: cost,
+                durationSeconds: durationSeconds,
+                timestamp: timestamp
             )
             if let effectiveAccountId {
                 perAccountToday[effectiveAccountId, default: UsageTotals()].add(
@@ -1460,7 +1647,9 @@ private struct DualScanState {
                     cacheRead: cacheRead,
                     cacheWrite: cacheWrite,
                     reasoning: reasoning,
-                    cost: cost
+                    cost: cost,
+                    durationSeconds: durationSeconds,
+                    timestamp: timestamp
                 )
             }
         }
@@ -1553,12 +1742,34 @@ private struct UsageAccumulator {
 private enum AntigravityProtoDecoder {
     struct StepMetadataUsage {
         var timestamp: Date?
+        var completedAt: Date?
         var modelEnumId: Int = 0
         var inputTokens: Int = 0
         var totalOutputTokens: Int = 0
         var cacheCreationTokens: Int = 0
         var cacheReadTokens: Int = 0
         var thinkingTokens: Int = 0
+
+        var durationSeconds: Double? {
+            guard let start = timestamp, let end = completedAt else { return nil }
+            let diff = end.timeIntervalSince(start)
+            return diff > 0 ? diff : nil
+        }
+    }
+
+    private static func decodeProtoTimestamp(_ sub: Data) -> Date? {
+        var secs: UInt64 = 0
+        var nanos: UInt64 = 0
+        parseFields(sub) { tsField, tsWire, tsVal in
+            guard tsWire == 0 else { return }
+            if tsField == 1 {
+                secs = tsVal.varint
+            } else if tsField == 2 {
+                nanos = tsVal.varint
+            }
+        }
+        guard secs > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(secs) + Double(nanos) / 1_000_000_000.0)
     }
 
     static func decodeStepMetadata(_ data: Data) -> StepMetadataUsage? {
@@ -1567,11 +1778,14 @@ private enum AntigravityProtoDecoder {
 
         parseFields(data) { fieldNum, wireType, payload in
             if fieldNum == 1 && wireType == 2, let sub = payload.bytes {
-                // google.protobuf.Timestamp { 1: seconds }
-                parseFields(sub) { tsField, tsWire, tsVal in
-                    if tsField == 1 && tsWire == 0, tsVal.varint > 0 {
-                        result.timestamp = Date(timeIntervalSince1970: Double(tsVal.varint))
-                    }
+                // google.protobuf.Timestamp created_at { 1: seconds, 2: nanos }
+                if let dt = decodeProtoTimestamp(sub) {
+                    result.timestamp = dt
+                }
+            } else if (fieldNum == 7 || fieldNum == 8) && wireType == 2, let sub = payload.bytes {
+                // google.protobuf.Timestamp completed_at { 1: seconds, 2: nanos }
+                if result.completedAt == nil, let dt = decodeProtoTimestamp(sub) {
+                    result.completedAt = dt
                 }
             } else if fieldNum == 9 && wireType == 2, let sub = payload.bytes {
                 // ModelUsageInfo

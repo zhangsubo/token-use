@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case accounts = "多账号管理"
@@ -21,6 +22,8 @@ struct SettingsView: View {
     @State private var editingAccount: AccountEditSession?
     @State private var xiaomiLoginTarget: ProviderAccountConfig?
     @State private var hostingWindow: NSWindow?
+    @State private var showAccountsOrderDrawer: Bool = false
+    @State private var draggingAccountTabProvider: TrackedProvider?
 
     @State private var customIntervalText: String = ""
     @State private var isCustomInterval: Bool = false
@@ -190,8 +193,8 @@ struct SettingsView: View {
 
     private var accountsTabContent: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Toggle("自动扫描并复用本机已有配置", isOn: $settings.enableAutoDiscovery)
+            HStack(spacing: 8) {
+                Toggle("自动扫描本机配置", isOn: $settings.enableAutoDiscovery)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .font(.system(size: 12.5, weight: .medium))
@@ -201,6 +204,18 @@ struct SettingsView: View {
                     }
 
                 Spacer()
+
+                Button {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        showAccountsOrderDrawer.toggle()
+                    }
+                } label: {
+                    Label(showAccountsOrderDrawer ? "完成排序" : "平台排序", systemImage: "arrow.up.arrow.down")
+                        .font(.system(size: 12, weight: showAccountsOrderDrawer ? .semibold : .regular))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(showAccountsOrderDrawer ? .cyan : nil)
 
                 Button {
                     appState.reloadAccountList()
@@ -213,7 +228,7 @@ struct SettingsView: View {
                 .controlSize(.small)
 
                 Menu {
-                    ForEach(TrackedProvider.allCases) { provider in
+                    ForEach(settings.providerOrder) { provider in
                         Button {
                             editingAccount = .newManual(provider: provider)
                         } label: {
@@ -233,7 +248,44 @@ struct SettingsView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    ForEach(TrackedProvider.allCases) { provider in
+                    if showAccountsOrderDrawer {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Label("拖动调整平台展示顺序（按平台整体排序）", systemImage: "line.3.horizontal")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.92))
+
+                                Spacer()
+
+                                if !settings.isDefaultProviderOrder {
+                                    Button("恢复默认") {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                                            settings.resetProviderOrder()
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                            }
+
+                            ProviderOrderDragList(
+                                settings: settings,
+                                accounts: appState.discoveredAccounts
+                            )
+                        }
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color(.sRGB, red: 0.14, green: 0.24, blue: 0.38).opacity(0.65))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .stroke(Color.cyan.opacity(0.35), lineWidth: 0.9)
+                                )
+                        )
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    ForEach(settings.providerOrder) { provider in
                         providerAccountGroup(provider)
                     }
                 }
@@ -245,24 +297,38 @@ struct SettingsView: View {
 
     private func providerAccountGroup(_ provider: TrackedProvider) -> some View {
         let accounts = appState.discoveredAccounts.filter { $0.provider == provider }
+        let isBeingDragged = draggingAccountTabProvider == provider
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(provider.accentColor.opacity(0.18))
-                        .frame(width: 24, height: 24)
+                HStack(spacing: 8) {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.42))
+                        .frame(width: 16, height: 24)
 
-                    ProviderBrandIcon(provider: provider, size: 15, cornerRadius: 3.5)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(provider.accentColor.opacity(0.18))
+                            .frame(width: 24, height: 24)
+
+                        ProviderBrandIcon(provider: provider, size: 15, cornerRadius: 3.5)
+                    }
+
+                    Text(provider.displayName)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+
+                    Text("(\(accounts.count))")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.5))
                 }
-
-                Text(provider.displayName)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
-
-                Text("(\(accounts.count))")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.5))
+                .contentShape(Rectangle())
+                .help("按住拖动可调整平台展示顺序")
+                .onDrag {
+                    draggingAccountTabProvider = provider
+                    return NSItemProvider(object: provider.rawValue as NSString)
+                }
 
                 Spacer()
 
@@ -306,13 +372,25 @@ struct SettingsView: View {
             }
         }
         .padding(12)
+        .opacity(isBeingDragged ? 0.72 : 1.0)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(.white.opacity(0.055))
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(.white.opacity(0.12), lineWidth: 0.7)
+                        .stroke(
+                            isBeingDragged ? provider.accentColor.opacity(0.65) : .white.opacity(0.12),
+                            lineWidth: isBeingDragged ? 1.1 : 0.7
+                        )
                 )
+        )
+        .onDrop(
+            of: [.plainText, .text],
+            delegate: ProviderCardDropDelegate(
+                targetProvider: provider,
+                draggingProvider: $draggingAccountTabProvider,
+                settings: settings
+            )
         )
     }
 
@@ -437,12 +515,63 @@ struct SettingsView: View {
     private var generalTabContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                displaySection
+                providerOrderSection
                 refreshSection
                 mascotSection
                 updateSection
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
+        }
+    }
+
+    private var displaySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("显示偏好")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white)
+
+            Toggle("显示估算金额（按 API 单价折算等效价值 ≈ $）", isOn: $settings.showEstimatedCost)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(.system(size: 13.5))
+                .foregroundStyle(.white.opacity(0.9))
+
+            Text("关闭后将隐藏今日、近 90 天及各平台分组上的等效美元价值估算标签。")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.white.opacity(0.5))
+        }
+    }
+
+    private var providerOrderSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("平台展示顺序")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                if !settings.isDefaultProviderOrder {
+                    Button("恢复默认顺序") {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                            settings.resetProviderOrder()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            Text("按住平台行上下拖动即可调整展示顺序（按平台整体排序，实时同步至主面板、筛选栏与侧边悬浮舱）。")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.white.opacity(0.5))
+
+            ProviderOrderDragList(
+                settings: settings,
+                accounts: appState.discoveredAccounts
+            )
         }
     }
 
@@ -713,7 +842,7 @@ private struct AccountEditorSheet: View {
             Form {
                 if !isAutoDiscovered {
                     Picker("所属平台", selection: $provider) {
-                        ForEach(TrackedProvider.allCases) { p in
+                        ForEach(settings.providerOrder) { p in
                             Text(p.displayName).tag(p)
                         }
                     }
@@ -953,5 +1082,219 @@ private struct SettingsWindowAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: WindowObserverView, context: Context) {
         nsView.configureChrome = configureChrome
         nsView.onResolve = onResolve
+    }
+}
+
+// MARK: - Provider Drag-to-Reorder Components
+
+private struct ProviderOrderDragList: View {
+    @ObservedObject var settings: SettingsManager
+    let accounts: [ProviderAccountConfig]
+
+    @State private var draggingProvider: TrackedProvider?
+    @State private var dragStartIndex: Int?
+    @State private var dragTranslationY: CGFloat = 0
+    @State private var hoveredProvider: TrackedProvider?
+
+    private let rowHeight: CGFloat = 38
+    private let rowSpacing: CGFloat = 6
+    private var stride: CGFloat { rowHeight + rowSpacing }
+
+    var body: some View {
+        VStack(spacing: rowSpacing) {
+            ForEach(settings.providerOrder) { provider in
+                let currentIndex = settings.providerOrder.firstIndex(of: provider) ?? 0
+                let isDragging = draggingProvider == provider
+                let isHovered = hoveredProvider == provider
+                let accountCount = accounts.filter { $0.provider == provider }.count
+
+                HStack(spacing: 10) {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDragging || isHovered ? 0.90 : 0.42))
+                        .frame(width: 16)
+
+                    Text("\(currentIndex + 1)")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .frame(width: 18, height: 18)
+                        .background(Circle().fill(.white.opacity(0.10)))
+
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(provider.accentColor.opacity(0.18))
+                            .frame(width: 24, height: 24)
+                        ProviderBrandIcon(provider: provider, size: 15, cornerRadius: 3.5)
+                    }
+
+                    Text(provider.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.95))
+
+                    Text(provider.vendorName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.52))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.white.opacity(0.08)))
+
+                    if accountCount > 0 {
+                        Text("\(accountCount) 账号")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(provider.accentColor.opacity(0.95))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(provider.accentColor.opacity(0.15)))
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Button {
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                settings.moveProvider(provider, to: currentIndex - 1)
+                            }
+                        } label: {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 10, weight: .bold))
+                                .frame(width: 20, height: 20)
+                                .background(Circle().fill(.white.opacity(0.08)))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(currentIndex == 0)
+                        .opacity(currentIndex == 0 ? 0.22 : (isHovered ? 0.90 : 0.45))
+                        .help("上移一位")
+
+                        Button {
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                settings.moveProvider(provider, to: currentIndex + 1)
+                            }
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .bold))
+                                .frame(width: 20, height: 20)
+                                .background(Circle().fill(.white.opacity(0.08)))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(currentIndex >= settings.providerOrder.count - 1)
+                        .opacity(currentIndex >= settings.providerOrder.count - 1 ? 0.22 : (isHovered ? 0.90 : 0.45))
+                        .help("下移一位")
+                    }
+                }
+                .padding(.horizontal, 11)
+                .frame(height: rowHeight)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(
+                            isDragging
+                                ? Color(.sRGB, red: 0.24, green: 0.32, blue: 0.48).opacity(0.96)
+                                : .white.opacity(isHovered ? 0.09 : 0.055)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(
+                                    isDragging
+                                        ? provider.accentColor.opacity(0.80)
+                                        : .white.opacity(isHovered ? 0.22 : 0.10),
+                                    lineWidth: isDragging ? 1.1 : 0.7
+                                )
+                        )
+                )
+                .contentShape(Rectangle())
+                .offset(y: rowOffset(for: provider, currentIndex: currentIndex))
+                .scaleEffect(isDragging ? 1.015 : 1.0)
+                .shadow(
+                    color: .black.opacity(isDragging ? 0.34 : 0.0),
+                    radius: isDragging ? 10 : 0,
+                    x: 0,
+                    y: isDragging ? 4 : 0
+                )
+                .zIndex(isDragging ? 10 : 0)
+                .onHover { hovering in
+                    if hovering {
+                        hoveredProvider = provider
+                    } else if hoveredProvider == provider {
+                        hoveredProvider = nil
+                    }
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 2, coordinateSpace: .named("ProviderOrderDragSpace"))
+                        .onChanged { value in
+                            if draggingProvider == nil {
+                                guard let idx = settings.providerOrder.firstIndex(of: provider) else { return }
+                                draggingProvider = provider
+                                dragStartIndex = idx
+                            }
+                            guard draggingProvider == provider, let startIdx = dragStartIndex else { return }
+
+                            let deltaY = value.location.y - value.startLocation.y
+                            dragTranslationY = deltaY
+
+                            let count = settings.providerOrder.count
+                            let rawTarget = (CGFloat(startIdx) * stride + deltaY) / stride
+                            let targetIdx = max(0, min(count - 1, Int(rawTarget.rounded())))
+
+                            if let currentIdx = settings.providerOrder.firstIndex(of: provider),
+                               currentIdx != targetIdx {
+                                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                    settings.moveProvider(provider, to: targetIdx)
+                                }
+                            }
+                        }
+                        .onEnded { _ in
+                            withAnimation(.spring(response: 0.22, dampingFraction: 0.84)) {
+                                draggingProvider = nil
+                                dragStartIndex = nil
+                                dragTranslationY = 0
+                            }
+                        }
+                )
+            }
+        }
+        .coordinateSpace(name: "ProviderOrderDragSpace")
+    }
+
+    private func rowOffset(for provider: TrackedProvider, currentIndex: Int) -> CGFloat {
+        guard draggingProvider == provider, let startIdx = dragStartIndex else {
+            return 0
+        }
+        let unclampedY = CGFloat(startIdx) * stride + dragTranslationY
+        let maxY = CGFloat(max(0, settings.providerOrder.count - 1)) * stride
+        let clampedY: CGFloat
+        if unclampedY < 0 {
+            clampedY = unclampedY * 0.22
+        } else if unclampedY > maxY {
+            clampedY = maxY + (unclampedY - maxY) * 0.22
+        } else {
+            clampedY = unclampedY
+        }
+        return clampedY - CGFloat(currentIndex) * stride
+    }
+}
+
+@MainActor
+private struct ProviderCardDropDelegate: DropDelegate {
+    let targetProvider: TrackedProvider
+    @Binding var draggingProvider: TrackedProvider?
+    let settings: SettingsManager
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard let source = draggingProvider,
+              source != targetProvider,
+              let targetIndex = settings.providerOrder.firstIndex(of: targetProvider) else {
+            return
+        }
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+            settings.moveProvider(source, to: targetIndex)
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingProvider = nil
+        return true
     }
 }

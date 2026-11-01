@@ -456,6 +456,8 @@ private struct TriggerCapsuleWithArrow: View {
     let isHovered: Bool
     let isVertical: Bool
     let dashboard: MultiAccountDashboard?
+    @ObservedObject private var settings = SettingsManager.shared
+    @ObservedObject private var activityMonitor = SessionActivityMonitor.shared
 
     private var todayText: String {
         NumberFormatterUtil.formatCompact(dashboard?.totalTodayTokens ?? 0)
@@ -521,9 +523,13 @@ private struct TriggerCapsuleWithArrow: View {
                         .frame(width: 24, height: 0.7)
 
                     VStack(spacing: 5.5) {
-                        ForEach(TrackedProvider.allCases) { provider in
+                        ForEach(settings.providerOrder) { provider in
                             let group = dashboard?.providers.first { $0.provider == provider }
-                            EdgeDockProviderGauge(provider: provider, group: group)
+                            EdgeDockProviderGauge(
+                                provider: provider,
+                                group: group,
+                                isActiveSession: activityMonitor.activeProviders.contains(provider)
+                            )
                         }
                     }
 
@@ -538,9 +544,13 @@ private struct TriggerCapsuleWithArrow: View {
                     Text(todayText)
                         .font(.system(size: 9.5, weight: .bold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.92))
-                    ForEach(TrackedProvider.allCases) { provider in
+                    ForEach(settings.providerOrder) { provider in
                         let group = dashboard?.providers.first { $0.provider == provider }
-                        EdgeDockProviderGauge(provider: provider, group: group)
+                        EdgeDockProviderGauge(
+                            provider: provider,
+                            group: group,
+                            isActiveSession: activityMonitor.activeProviders.contains(provider)
+                        )
                     }
                 }
                 .padding(.horizontal, 10)
@@ -553,38 +563,76 @@ private struct TriggerCapsuleWithArrow: View {
 private struct EdgeDockProviderGauge: View {
     let provider: TrackedProvider
     let group: ProviderGroupSnapshot?
+    let isActiveSession: Bool
 
     private var remainingPercent: Double? {
         group?.representativeRemainingPercent
     }
 
     private var hasAnyActivity: Bool {
+        if isActiveSession { return true }
         guard let group else { return false }
         return !group.accounts.isEmpty || group.allTimeTokens > 0
     }
 
+    private var activeRingColor: Color {
+        if let rem = remainingPercent {
+            return ringColor(for: rem)
+        }
+        return provider.accentColor
+    }
+
     var body: some View {
         ZStack {
-            Circle()
-                .stroke(.white.opacity(hasAnyActivity ? 0.15 : 0.08), lineWidth: 2.1)
+            if isActiveSession {
+                Circle()
+                    .stroke(activeRingColor.opacity(0.26), lineWidth: 2.1)
 
-            if let rem = remainingPercent {
-                if rem <= 0 {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                    let period = 1.15
+                    let phase = context.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: period) / period
+                    let angle = phase * 360.0
+
                     Circle()
-                        .stroke(Color(.sRGB, red: 1.0, green: 0.36, blue: 0.36).opacity(0.55), lineWidth: 2.1)
-                } else {
-                    Circle()
-                        .trim(from: 0, to: min(1.0, max(0.03, rem / 100.0)))
+                        .trim(from: 0.0, to: 0.72)
                         .stroke(
-                            ringColor(for: rem),
-                            style: StrokeStyle(lineWidth: 2.1, lineCap: .round)
+                            AngularGradient(
+                                gradient: Gradient(stops: [
+                                    .init(color: activeRingColor.opacity(0.04), location: 0.0),
+                                    .init(color: activeRingColor.opacity(0.88), location: 0.54),
+                                    .init(color: .white.opacity(0.96), location: 0.71),
+                                    .init(color: .clear, location: 0.73),
+                                ]),
+                                center: .center
+                            ),
+                            style: StrokeStyle(lineWidth: 2.35, lineCap: .round)
                         )
-                        .rotationEffect(.degrees(-90))
+                        .rotationEffect(.degrees(angle - 90.0))
+                        .shadow(color: activeRingColor.opacity(0.55), radius: 3.0)
+                }
+            } else {
+                Circle()
+                    .stroke(.white.opacity(hasAnyActivity ? 0.15 : 0.08), lineWidth: 2.1)
+
+                if let rem = remainingPercent {
+                    if rem <= 0 {
+                        Circle()
+                            .stroke(Color(.sRGB, red: 1.0, green: 0.36, blue: 0.36).opacity(0.55), lineWidth: 2.1)
+                    } else {
+                        Circle()
+                            .trim(from: 0, to: min(1.0, max(0.03, rem / 100.0)))
+                            .stroke(
+                                ringColor(for: rem),
+                                style: StrokeStyle(lineWidth: 2.1, lineCap: .round)
+                            )
+                            .rotationEffect(.degrees(-90))
+                    }
                 }
             }
 
             ProviderBrandIcon(provider: provider, size: 12.5, cornerRadius: 3)
-                .opacity(hasAnyActivity ? 0.96 : 0.42)
+                .opacity(hasAnyActivity ? 0.98 : 0.42)
         }
         .frame(width: 24, height: 24)
     }

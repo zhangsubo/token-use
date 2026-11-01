@@ -26,6 +26,8 @@ final class AppState: ObservableObject {
 
     private var timer: Timer?
     private var hasStarted = false
+    private var isRefreshingLocalOnly = false
+    private var lastQuotaResults: [String: ProviderQuotaResult] = [:]
     private let dashboardCacheFilename = "dashboard-v3.json"
 
     private init() {}
@@ -36,6 +38,15 @@ final class AppState: ObservableObject {
 
         DebugLogger.log("🚀 [AppState] start() 开始")
         reloadAccountList()
+
+        SessionActivityMonitor.shared.onSessionTurnFinished = { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.refreshLocalUsageOnly()
+            }
+        }
+        SessionActivityMonitor.shared.start { [weak self] in
+            self?.discoveredAccounts ?? []
+        }
 
         // 1. 若有 1 小时内的多账号快照，先瞬时展示（保留缓存中的今日数据与配额，绝不置零闪烁），再后台刷新
         if let cached = await reportManager.loadSnapshot(
@@ -60,6 +71,53 @@ final class AppState: ObservableObject {
     func refresh() async {
         reloadAccountList()
         await performSync(showBlockingSpinner: dashboard == nil)
+    }
+
+    /// 当本地会话刚结束一轮生成时触发：仅增量刷新本地日志 Token 与 tok/s，复用最近一次在线配额结果，避免频繁请求远端接口
+    func refreshLocalUsageOnly() async {
+        guard !isLoading, !isRefreshingLocalOnly, !lastQuotaResults.isEmpty else { return }
+        isRefreshingLocalOnly = true
+        defer { isRefreshingLocalOnly = false }
+
+        let settings = SettingsManager.shared
+        let manualAccounts = settings.manualAccounts
+        let overrides = settings.accountOverrides
+        let autoEnabled = settings.enableAutoDiscovery
+
+        let bundle = await Task.detached(priority: .utility) {
+            AccountDiscoveryService.resolveAccounts(
+                manualAccounts: manualAccounts,
+                overrides: overrides,
+                enableAutoDiscovery: autoEnabled
+            )
+        }.value
+
+        self.discoveredAccounts = bundle.allAccounts
+        self.activeCodexAccountIds = bundle.activeCodexAccountIds
+        let enabledAccounts = bundle.enabledAccounts
+
+        let dynamicModels = await quotaService.modelMapForAntigravity()
+        let localUsage = await nativeUsageService.fetchCombined(
+            accounts: enabledAccounts,
+            dynamicAntigravityModels: dynamicModels
+        )
+
+        guard !isLoading else { return }
+        let now = Date()
+        let builtDashboard = buildDashboard(
+            enabledAccounts: enabledAccounts,
+            activeCodexAccountIds: bundle.activeCodexAccountIds,
+            localUsage: localUsage,
+            quotaResults: lastQuotaResults,
+            updatedAt: now
+        )
+        self.dashboard = builtDashboard
+        self.stats = TokenStats(
+            allTime: localUsage.allTimeReport,
+            today: localUsage.todayReport,
+            updatedAt: now
+        )
+        try? await reportManager.saveSnapshot(builtDashboard, filename: dashboardCacheFilename)
     }
 
     /// 一键切换本机 `$CODEX_HOME/auth.json` 当前活跃的 Codex OAuth 账号
@@ -138,6 +196,7 @@ final class AppState: ObservableObject {
             ephemeralSecrets: bundle.ephemeralSecrets,
             offlineCodexSnapshots: localUsage.offlineCodexSnapshots
         )
+        self.lastQuotaResults = quotaResults
 
         let now = Date()
         let builtDashboard = buildDashboard(
@@ -167,6 +226,19 @@ final class AppState: ObservableObject {
         DebugLogger.log("✅ [AppState] 同步完成: \(builtDashboard.totalActiveAccounts) 个活跃账号")
     }
 
+    private func resolveSpeed(
+        today: SpeedSampleAccumulator,
+        allTime: SpeedSampleAccumulator
+    ) -> (avg: Double?, latest: Double?, isToday: Bool) {
+        if let todayAvg = today.averageTokensPerSecond {
+            return (todayAvg, today.latestTokensPerSecond ?? allTime.latestTokensPerSecond, true)
+        }
+        if let allAvg = allTime.averageTokensPerSecond {
+            return (allAvg, allTime.latestTokensPerSecond, false)
+        }
+        return (nil, nil, true)
+    }
+
     private func buildDashboard(
         enabledAccounts: [ProviderAccountConfig],
         activeCodexAccountIds: Set<String>,
@@ -182,6 +254,7 @@ final class AppState: ObservableObject {
             let pAccounts = enabledAccounts.filter { $0.provider == provider }
             var snapshots: [AccountUsageSnapshot] = []
             var seenExternalIndex: [String: Int] = [:]
+            var mergedSpeedByIndex: [Int: (today: SpeedSampleAccumulator, allTime: SpeedSampleAccumulator)] = [:]
 
             for acct in pAccounts {
                 let q = quotaResults[acct.id]
@@ -228,6 +301,15 @@ final class AppState: ObservableObject {
                         snapshots[existingIdx].allTimeBreakdown = mergedAll
                     }
 
+                    var speedPair = mergedSpeedByIndex[existingIdx] ?? (SpeedSampleAccumulator(), SpeedSampleAccumulator())
+                    speedPair.today.merge(acctToday.speed)
+                    speedPair.allTime.merge(acctAllTime.speed)
+                    mergedSpeedByIndex[existingIdx] = speedPair
+                    let resolvedMergedSpeed = resolveSpeed(today: speedPair.today, allTime: speedPair.allTime)
+                    snapshots[existingIdx].tokensPerSecond = resolvedMergedSpeed.avg
+                    snapshots[existingIdx].latestTokensPerSecond = resolvedMergedSpeed.latest
+                    snapshots[existingIdx].speedIsToday = resolvedMergedSpeed.isToday
+
                     let mergedActive = snapshots[existingIdx].isActiveSystemAccount || isActiveSystem
                     snapshots[existingIdx].isActiveSystemAccount = mergedActive
                     if provider == .codex {
@@ -250,6 +332,7 @@ final class AppState: ObservableObject {
                     continue
                 }
 
+                let acctSpeed = resolveSpeed(today: acctToday.speed, allTime: acctAllTime.speed)
                 let snap = AccountUsageSnapshot(
                     id: acct.id,
                     provider: provider,
@@ -270,10 +353,15 @@ final class AppState: ObservableObject {
                     allTimeCost: acctAllTime.cost,
                     todayBreakdown: acctToday.tokens > 0 ? acctToday.breakdown : nil,
                     allTimeBreakdown: acctAllTime.tokens > 0 ? acctAllTime.breakdown : nil,
+                    tokensPerSecond: acctSpeed.avg,
+                    latestTokensPerSecond: acctSpeed.latest,
+                    speedIsToday: acctSpeed.isToday,
                     updatedAt: updatedAt
                 )
+                let newIndex = snapshots.count
+                mergedSpeedByIndex[newIndex] = (acctToday.speed, acctAllTime.speed)
                 if acct.source == .autoDiscovered, let key = dedupExternalKey, !key.isEmpty {
-                    seenExternalIndex[key] = snapshots.count
+                    seenExternalIndex[key] = newIndex
                 }
                 snapshots.append(snap)
             }
@@ -296,6 +384,7 @@ final class AppState: ObservableObject {
             let providerAllTime = localUsage.perProviderAllTime[provider] ?? UsageTotals()
             grandTodayBreakdown.merge(providerToday.breakdown)
             grandAllTimeBreakdown.merge(providerAllTime.breakdown)
+            let providerSpeed = resolveSpeed(today: providerToday.speed, allTime: providerAllTime.speed)
 
             providerGroups.append(ProviderGroupSnapshot(
                 provider: provider,
@@ -305,7 +394,10 @@ final class AppState: ObservableObject {
                 allTimeTokens: providerAllTime.tokens,
                 allTimeCost: providerAllTime.cost,
                 todayBreakdown: providerToday.tokens > 0 ? providerToday.breakdown : nil,
-                allTimeBreakdown: providerAllTime.tokens > 0 ? providerAllTime.breakdown : nil
+                allTimeBreakdown: providerAllTime.tokens > 0 ? providerAllTime.breakdown : nil,
+                tokensPerSecond: providerSpeed.avg,
+                latestTokensPerSecond: providerSpeed.latest,
+                speedIsToday: providerSpeed.isToday
             ))
         }
 

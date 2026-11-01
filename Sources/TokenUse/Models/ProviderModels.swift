@@ -325,6 +325,9 @@ struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var allTimeCost: Double
     var todayBreakdown: TokenBreakdownSnapshot? = nil
     var allTimeBreakdown: TokenBreakdownSnapshot? = nil
+    var tokensPerSecond: Double? = nil
+    var latestTokensPerSecond: Double? = nil
+    var speedIsToday: Bool = true
     var updatedAt: Date
 }
 
@@ -338,10 +341,20 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
     var allTimeCost: Double
     var todayBreakdown: TokenBreakdownSnapshot? = nil
     var allTimeBreakdown: TokenBreakdownSnapshot? = nil
+    var tokensPerSecond: Double? = nil
+    var latestTokensPerSecond: Double? = nil
+    var speedIsToday: Bool = true
 
     /// 用于右侧边缘停靠条 (Edge Dock) 展示该平台当前剩余配额环形图百分比（0...100）
     var representativeRemainingPercent: Double? {
-        let activeCandidates = accounts.filter { $0.isActiveSystemAccount && !$0.quotaWindows.isEmpty }
+        let activeCandidates: [AccountUsageSnapshot]
+        if provider == .antigravity {
+            activeCandidates = accounts.filter {
+                !$0.quotaWindows.isEmpty && ($0.isActiveSystemAccount || $0.sourceBadge == "Antigravity IDE")
+            }
+        } else {
+            activeCandidates = accounts.filter { $0.isActiveSystemAccount && !$0.quotaWindows.isEmpty }
+        }
         let sourceAccounts = activeCandidates.isEmpty
             ? accounts.filter { !$0.quotaWindows.isEmpty }
             : activeCandidates
@@ -350,7 +363,42 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
             let hasUnlimited = sourceAccounts.contains { $0.quotaWindows.contains(where: \.isUnlimited) }
             return hasUnlimited ? 100.0 : nil
         }
+
+        // Antigravity 仅看 Gemini 配额池，忽略 Claude / GPT 配额池
+        if provider == .antigravity {
+            let geminiWindows = finiteWindows.filter { window in
+                let idLower = window.id.lowercased()
+                let labelLower = window.label.lowercased()
+                let isClaudeOrGPT = idLower.contains("claude") || idLower.contains("gpt")
+                    || labelLower.contains("claude") || labelLower.contains("gpt")
+                guard !isClaudeOrGPT else { return false }
+                return idLower.contains("gemini") || labelLower.contains("gemini") || idLower.contains("argon")
+            }
+            if !geminiWindows.isEmpty {
+                return geminiWindows.map(\.remainingPercent).min()
+            }
+        }
+
         return finiteWindows.map(\.remainingPercent).min()
+    }
+}
+
+enum SpeedFormatter {
+    static func format(_ value: Double) -> String {
+        if value >= 100 {
+            return String(format: "%.0f tok/s", value)
+        }
+        return String(format: "%.1f tok/s", value)
+    }
+
+    static func tooltip(average: Double, latest: Double?, isToday: Bool) -> String {
+        let scope = isToday ? "今日平均生成速率" : "近 90 天平均生成速率"
+        let avgStr = average >= 100 ? String(format: "%.0f", average) : String(format: "%.1f", average)
+        if let latest, latest > 0 {
+            let latestStr = latest >= 100 ? String(format: "%.0f", latest) : String(format: "%.1f", latest)
+            return "\(scope) \(avgStr) tok/s · 最近一轮 \(latestStr) tok/s（按输出 + 思考 Token 实测耗时计算）"
+        }
+        return "\(scope) \(avgStr) tok/s（按输出 + 思考 Token 实测耗时计算）"
     }
 }
 

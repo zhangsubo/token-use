@@ -16,6 +16,8 @@ final class SettingsManager: ObservableObject {
         static let lastUpdateCheckDate = "lastUpdateCheckDate"
         static let skippedVersion = "skippedVersion"
         static let enableAutoDiscovery = "enableAutoDiscovery"
+        static let showEstimatedCost = "showEstimatedCost"
+        static let providerOrder = "providerOrder"
     }
 
     private struct PersistedAccountStore: Codable {
@@ -51,6 +53,16 @@ final class SettingsManager: ObservableObject {
         didSet { defaults.set(enableAutoDiscovery, forKey: Keys.enableAutoDiscovery) }
     }
 
+    @Published var showEstimatedCost: Bool {
+        didSet { defaults.set(showEstimatedCost, forKey: Keys.showEstimatedCost) }
+    }
+
+    @Published var providerOrder: [TrackedProvider] {
+        didSet {
+            defaults.set(providerOrder.map(\.rawValue), forKey: Keys.providerOrder)
+        }
+    }
+
     @Published private(set) var manualAccounts: [ProviderAccountConfig] = []
     @Published private(set) var accountOverrides: [String: AccountOverride] = [:]
 
@@ -77,10 +89,55 @@ final class SettingsManager: ObservableObject {
             self.enableAutoDiscovery = defaults.bool(forKey: Keys.enableAutoDiscovery)
         }
 
+        if defaults.object(forKey: Keys.showEstimatedCost) == nil {
+            self.showEstimatedCost = true
+        } else {
+            self.showEstimatedCost = defaults.bool(forKey: Keys.showEstimatedCost)
+        }
+
+        self.providerOrder = Self.normalizedProviderOrder(from: defaults.stringArray(forKey: Keys.providerOrder))
+
         self.lastUpdateCheckDate = defaults.object(forKey: Keys.lastUpdateCheckDate) as? Date
         self.skippedVersion = defaults.string(forKey: Keys.skippedVersion)
 
         loadAccountStore()
+    }
+
+    // MARK: - Provider Display Order
+
+    var isDefaultProviderOrder: Bool {
+        providerOrder == TrackedProvider.allCases
+    }
+
+    func resetProviderOrder() {
+        providerOrder = TrackedProvider.allCases
+    }
+
+    func moveProvider(_ provider: TrackedProvider, to targetIndex: Int) {
+        guard let fromIndex = providerOrder.firstIndex(of: provider) else { return }
+        let clampedIndex = max(0, min(providerOrder.count - 1, targetIndex))
+        guard fromIndex != clampedIndex else { return }
+        var updated = providerOrder
+        updated.remove(at: fromIndex)
+        updated.insert(provider, at: clampedIndex)
+        providerOrder = updated
+    }
+
+    private static func normalizedProviderOrder(from rawValues: [String]?) -> [TrackedProvider] {
+        guard let rawValues, !rawValues.isEmpty else {
+            return TrackedProvider.allCases
+        }
+        var seen = Set<TrackedProvider>()
+        var result: [TrackedProvider] = []
+        for raw in rawValues {
+            if let provider = TrackedProvider(rawValue: raw), seen.insert(provider).inserted {
+                result.append(provider)
+            }
+        }
+        for provider in TrackedProvider.allCases where seen.insert(provider).inserted {
+            result.append(provider)
+        }
+        return result
     }
 
     // MARK: - Multi-Account Persistence
