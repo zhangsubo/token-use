@@ -272,11 +272,26 @@ final class AppState: ObservableObject {
         var grandTodayBreakdown = TokenBreakdownSnapshot()
         var grandAllTimeBreakdown = TokenBreakdownSnapshot()
 
+        // 预先按 accountId 归组本机单模型明细，供与官方计费模型列表 O(1) 合并
+        var localTodayEntriesByAcct: [String: [TokscaleEntry]] = [:]
+        for entry in localUsage.todayReport.entries {
+            if let aid = entry.accountId {
+                localTodayEntriesByAcct[aid, default: []].append(entry)
+            }
+        }
+        var localAllTimeEntriesByAcct: [String: [TokscaleEntry]] = [:]
+        for entry in localUsage.allTimeReport.entries {
+            if let aid = entry.accountId {
+                localAllTimeEntriesByAcct[aid, default: []].append(entry)
+            }
+        }
+
         for provider in TrackedProvider.allCases {
             let pAccounts = enabledAccounts.filter { $0.provider == provider }
             var snapshots: [AccountUsageSnapshot] = []
             var seenExternalIndex: [String: Int] = [:]
             var mergedSpeedByIndex: [Int: (today: SpeedSampleAccumulator, allTime: SpeedSampleAccumulator)] = [:]
+            var mergedAcctIdsByIndex: [Int: [String]] = [:]
 
             for acct in pAccounts {
                 let q = quotaResults[acct.id]
@@ -307,10 +322,23 @@ final class AppState: ObservableObject {
                 if acct.source == .autoDiscovered,
                    let key = dedupExternalKey, !key.isEmpty,
                    let existingIdx = seenExternalIndex[key] {
-                    snapshots[existingIdx].todayTokens += acctToday.tokens
+                    mergedAcctIdsByIndex[existingIdx, default: []].append(acct.id)
+                    let prevLocalToday = snapshots[existingIdx].localTodayTokens ?? snapshots[existingIdx].todayTokens
+                    let combinedLocalToday = prevLocalToday + acctToday.tokens
+                    snapshots[existingIdx].localTodayTokens = combinedLocalToday
                     snapshots[existingIdx].todayCost += acctToday.cost
-                    snapshots[existingIdx].allTimeTokens += acctAllTime.tokens
                     snapshots[existingIdx].allTimeCost += acctAllTime.cost
+
+                    if snapshots[existingIdx].cloudBilling == nil {
+                        snapshots[existingIdx].cloudBilling = q?.cloudBilling
+                    }
+                    let cloudToday = snapshots[existingIdx].cloudBilling?.todayTokens ?? 0
+                    let effectiveToday = max(combinedLocalToday, cloudToday)
+                    snapshots[existingIdx].todayTokens = effectiveToday
+                    snapshots[existingIdx].allTimeTokens = max(
+                        snapshots[existingIdx].allTimeTokens + acctAllTime.tokens,
+                        effectiveToday
+                    )
 
                     if acctToday.tokens > 0 {
                         var mergedToday = snapshots[existingIdx].todayBreakdown ?? TokenBreakdownSnapshot()
@@ -355,6 +383,11 @@ final class AppState: ObservableObject {
                 }
 
                 let acctSpeed = resolveSpeed(today: acctToday.speed, allTime: acctAllTime.speed)
+                let rawLocalToday = acctToday.tokens
+                let cloudToday = q?.cloudBilling?.todayTokens ?? 0
+                let effectiveAcctToday = max(rawLocalToday, cloudToday)
+                let effectiveAcctAllTime = max(acctAllTime.tokens, effectiveAcctToday)
+
                 let snap = AccountUsageSnapshot(
                     id: acct.id,
                     provider: provider,
@@ -369,23 +402,41 @@ final class AppState: ObservableObject {
                     canSwitchSystemAccount: canSwitchSystem,
                     walletBalanceText: q?.walletBalanceText,
                     resetCreditsText: q?.resetCreditsText,
-                    todayTokens: acctToday.tokens,
+                    todayTokens: effectiveAcctToday,
+                    localTodayTokens: rawLocalToday,
                     todayCost: acctToday.cost,
-                    allTimeTokens: acctAllTime.tokens,
+                    allTimeTokens: effectiveAcctAllTime,
                     allTimeCost: acctAllTime.cost,
                     todayBreakdown: acctToday.tokens > 0 ? acctToday.breakdown : nil,
                     allTimeBreakdown: acctAllTime.tokens > 0 ? acctAllTime.breakdown : nil,
                     tokensPerSecond: acctSpeed.avg,
                     latestTokensPerSecond: acctSpeed.latest,
                     speedIsToday: acctSpeed.isToday,
+                    cloudBilling: q?.cloudBilling,
+                    modelUsages: nil,
                     updatedAt: updatedAt
                 )
                 let newIndex = snapshots.count
                 mergedSpeedByIndex[newIndex] = (acctToday.speed, acctAllTime.speed)
+                mergedAcctIdsByIndex[newIndex] = [acct.id]
                 if acct.source == .autoDiscovered, let key = dedupExternalKey, !key.isEmpty {
                     seenExternalIndex[key] = newIndex
                 }
                 snapshots.append(snap)
+            }
+
+            // 为每个账号融合「官方计费/配额分模型数据」与「本机会话分模型日志」
+            for idx in snapshots.indices {
+                let acctIds = mergedAcctIdsByIndex[idx] ?? [snapshots[idx].id]
+                let todayEntries = acctIds.flatMap { localTodayEntriesByAcct[$0] ?? [] }
+                let allTimeEntries = acctIds.flatMap { localAllTimeEntriesByAcct[$0] ?? [] }
+                let mergedModels = mergeModelUsages(
+                    accountId: snapshots[idx].id,
+                    cloudModels: snapshots[idx].cloudBilling?.models ?? [],
+                    localTodayEntries: todayEntries,
+                    localAllTimeEntries: allTimeEntries
+                )
+                snapshots[idx].modelUsages = mergedModels.isEmpty ? nil : mergedModels
             }
 
             // 若已存在活跃的 ~/.kimi-code (v2) 账号，且旧版遗留 ~/.kimi (v1) 90 天内无任何日志且凭证已失效，默认隐藏废弃幽灵卡片（除非用户显式开启）
@@ -408,18 +459,25 @@ final class AppState: ObservableObject {
             grandAllTimeBreakdown.merge(providerAllTime.breakdown)
             let providerSpeed = resolveSpeed(today: providerToday.speed, allTime: providerAllTime.speed)
 
+            let sumAccountToday = snapshots.reduce(0) { $0 + $1.todayTokens }
+            let effectiveProviderToday = max(providerToday.tokens, sumAccountToday)
+            let effectiveProviderAllTime = max(providerAllTime.tokens, effectiveProviderToday)
+            let groupModels = aggregateProviderModelUsages(provider: provider, accounts: snapshots)
+
             providerGroups.append(ProviderGroupSnapshot(
                 provider: provider,
                 accounts: snapshots,
-                todayTokens: providerToday.tokens,
+                todayTokens: effectiveProviderToday,
+                localTodayTokens: providerToday.tokens,
                 todayCost: providerToday.cost,
-                allTimeTokens: providerAllTime.tokens,
+                allTimeTokens: effectiveProviderAllTime,
                 allTimeCost: providerAllTime.cost,
                 todayBreakdown: providerToday.tokens > 0 ? providerToday.breakdown : nil,
                 allTimeBreakdown: providerAllTime.tokens > 0 ? providerAllTime.breakdown : nil,
                 tokensPerSecond: providerSpeed.avg,
                 latestTokensPerSecond: providerSpeed.latest,
-                speedIsToday: providerSpeed.isToday
+                speedIsToday: providerSpeed.isToday,
+                modelUsages: groupModels.isEmpty ? nil : groupModels
             ))
         }
 
@@ -438,6 +496,173 @@ final class AppState: ObservableObject {
             totalAllTimeBreakdown: totalAllTimeTokens > 0 ? grandAllTimeBreakdown : nil,
             updatedAt: updatedAt
         )
+    }
+
+    private func canonicalModelMatchKey(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let slash = s.lastIndex(of: "/") {
+            s = String(s[s.index(after: slash)...])
+        }
+        s = s.replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "_", with: "-")
+        return s
+    }
+
+    private func strippedEffortSuffixKey(_ key: String) -> String {
+        var s = key
+        for suffix in ["-(high)", "-(medium)", "-(low)", "-(minimal)", "-high", "-medium", "-low"] {
+            if s.hasSuffix(suffix) {
+                s = String(s.dropLast(suffix.count))
+                break
+            }
+        }
+        return s
+    }
+
+    private func mergeModelUsages(
+        accountId: String,
+        cloudModels: [ModelUsageItem],
+        localTodayEntries: [TokscaleEntry],
+        localAllTimeEntries: [TokscaleEntry]
+    ) -> [ModelUsageItem] {
+        struct LocalAgg {
+            var displayName: String
+            var todayTokens: Int = 0
+            var allTimeTokens: Int = 0
+            var cost: Double = 0.0
+        }
+
+        var localByKey: [String: LocalAgg] = [:]
+        for entry in localAllTimeEntries {
+            let key = canonicalModelMatchKey(entry.model)
+            guard !key.isEmpty else { continue }
+            var agg = localByKey[key] ?? LocalAgg(displayName: entry.model)
+            agg.allTimeTokens += entry.totalTokens
+            agg.cost += entry.cost
+            localByKey[key] = agg
+        }
+        for entry in localTodayEntries {
+            let key = canonicalModelMatchKey(entry.model)
+            guard !key.isEmpty else { continue }
+            var agg = localByKey[key] ?? LocalAgg(displayName: entry.model)
+            agg.todayTokens += entry.totalTokens
+            if agg.allTimeTokens < agg.todayTokens {
+                agg.allTimeTokens = agg.todayTokens
+            }
+            localByKey[key] = agg
+        }
+
+        var merged: [ModelUsageItem] = []
+        for var item in cloudModels {
+            if let rawMatch = item.matchKey {
+                let cKey = canonicalModelMatchKey(rawMatch)
+                let matchedLocalKey: String? = {
+                    if localByKey[cKey] != nil { return cKey }
+                    let base = strippedEffortSuffixKey(cKey)
+                    if base != cKey, localByKey[base] != nil { return base }
+                    return localByKey.keys.first { strippedEffortSuffixKey($0) == base && !base.isEmpty }
+                }()
+
+                if let lKey = matchedLocalKey, let loc = localByKey.removeValue(forKey: lKey) {
+                    item.origin = .merged
+                    item.localTodayTokens = loc.todayTokens
+                    item.localAllTimeTokens = loc.allTimeTokens
+                    item.localCost = loc.cost
+                }
+            }
+            merged.append(item)
+        }
+
+        let remainingLocals = localByKey.sorted { $0.value.allTimeTokens > $1.value.allTimeTokens }
+        for (key, loc) in remainingLocals where loc.allTimeTokens > 0 || loc.todayTokens > 0 {
+            merged.append(ModelUsageItem(
+                id: "local.\(accountId).\(key)",
+                modelName: loc.displayName,
+                origin: .localOnly,
+                matchKey: key,
+                localTodayTokens: loc.todayTokens,
+                localAllTimeTokens: loc.allTimeTokens,
+                localCost: loc.cost
+            ))
+        }
+
+        // 将有实际活跃消耗的模型排在前列，空闲 0% 配额池排在其后
+        return merged.enumerated().sorted { lhs, rhs in
+            let a = lhs.element
+            let b = rhs.element
+            let aActive = isModelItemActive(a)
+            let bActive = isModelItemActive(b)
+            if aActive != bActive { return aActive && !bActive }
+            let aVol = max(a.cloudPeriodTokens ?? 0, a.localAllTimeTokens)
+            let bVol = max(b.cloudPeriodTokens ?? 0, b.localAllTimeTokens)
+            if aVol != bVol { return aVol > bVol }
+            let aUsed = a.cloudUsedPercent ?? -1
+            let bUsed = b.cloudUsedPercent ?? -1
+            if abs(aUsed - bUsed) > 0.4 { return aUsed > bUsed }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private func isModelItemActive(_ item: ModelUsageItem) -> Bool {
+        (item.cloudTodayTokens ?? 0) > 0
+            || (item.cloudPeriodTokens ?? 0) > 0
+            || item.localTodayTokens > 0
+            || item.localAllTimeTokens > 0
+            || (item.cloudSpendText?.isEmpty == false)
+            || (item.cloudUsedPercent ?? 0) > 0.4
+    }
+
+    private func aggregateProviderModelUsages(
+        provider: TrackedProvider,
+        accounts: [AccountUsageSnapshot]
+    ) -> [ModelUsageItem] {
+        if accounts.count == 1 {
+            return accounts[0].resolvedModelUsages
+        }
+        var byKey: [String: ModelUsageItem] = [:]
+        var order: [String] = []
+        for acct in accounts {
+            for item in acct.resolvedModelUsages {
+                let key = canonicalModelMatchKey(item.matchKey ?? item.modelName)
+                guard !key.isEmpty else { continue }
+                if var existing = byKey[key] {
+                    if existing.origin != item.origin {
+                        existing.origin = .merged
+                    }
+                    if let ct = item.cloudTodayTokens {
+                        existing.cloudTodayTokens = (existing.cloudTodayTokens ?? 0) + ct
+                    }
+                    if let cp = item.cloudPeriodTokens {
+                        existing.cloudPeriodTokens = (existing.cloudPeriodTokens ?? 0) + cp
+                    }
+                    if existing.cloudPeriodLabel == nil {
+                        existing.cloudPeriodLabel = item.cloudPeriodLabel
+                    }
+                    if let cr = item.cloudRequests {
+                        existing.cloudRequests = (existing.cloudRequests ?? 0) + cr
+                    }
+                    if existing.cloudSpendText == nil {
+                        existing.cloudSpendText = item.cloudSpendText
+                    }
+                    if let pct = item.cloudUsedPercent {
+                        existing.cloudUsedPercent = max(existing.cloudUsedPercent ?? 0, pct)
+                    }
+                    if existing.cloudQuotaText == nil {
+                        existing.cloudQuotaText = item.cloudQuotaText
+                    }
+                    existing.localTodayTokens += item.localTodayTokens
+                    existing.localAllTimeTokens += item.localAllTimeTokens
+                    existing.localCost += item.localCost
+                    byKey[key] = existing
+                } else {
+                    var fresh = item
+                    fresh.id = "\(provider.rawValue).group.\(key)"
+                    byKey[key] = fresh
+                    order.append(key)
+                }
+            }
+        }
+        return order.compactMap { byKey[$0] }
     }
 
     // MARK: - Timer

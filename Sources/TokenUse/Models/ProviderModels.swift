@@ -311,6 +311,86 @@ struct TokenBreakdownSnapshot: Codable, Sendable, Equatable {
     }
 }
 
+enum ModelUsageOrigin: String, Codable, Sendable, Equatable {
+    /// 来自官方计费/配额接口（包含其他设备、网页端、云端与 API 调用）
+    case officialCloud = "officialCloud"
+    /// 官方计费/配额接口 + 本机会话日志联合校核
+    case merged = "merged"
+    /// 仅来自本机 CLI / IDE 会话日志
+    case localOnly = "localOnly"
+
+    var badgeText: String {
+        switch self {
+        case .officialCloud: return "官方云端"
+        case .merged: return "云端+本机"
+        case .localOnly: return "本机日志"
+        }
+    }
+}
+
+/// 单个模型的官方计费/配额与本机使用情况快照
+struct ModelUsageItem: Codable, Sendable, Identifiable, Equatable {
+    var id: String
+    var modelName: String
+    var origin: ModelUsageOrigin
+    /// 用于跨源合并的规范化匹配键（可选，例如 Kimi "kimi-for-coding"）
+    var matchKey: String? = nil
+    /// 官方云端今日 Token（若官方接口提供）
+    var cloudTodayTokens: Int? = nil
+    /// 官方云端周期（本月 / 近 30d / 账单）Token（若官方接口提供）
+    var cloudPeriodTokens: Int? = nil
+    /// 官方云端周期标签（如 "本月"、"30d"、"账单"）
+    var cloudPeriodLabel: String? = nil
+    /// 官方云端调用次数 / 请求数（若官方接口提供）
+    var cloudRequests: Int? = nil
+    /// 官方云端消耗金额或积分文本（如 "¥0.38"、"$3.20"、"74.3 cr"）
+    var cloudSpendText: String? = nil
+    /// 官方云端该模型配额已用百分比 0...100（如 Antigravity 单模型池、MiniMax 模型池、Codex 附加池）
+    var cloudUsedPercent: Double? = nil
+    /// 官方云端该模型配额明细文本（如 "云端剩余 99%"、"5h 99% · 7d 100%"、"1M ctx · 可用"）
+    var cloudQuotaText: String? = nil
+    /// 官方云端该模型配额重置时间
+    var cloudResetAt: Date? = nil
+    /// 本机会话今日 Token
+    var localTodayTokens: Int = 0
+    /// 本机会话近 90 天 Token
+    var localAllTimeTokens: Int = 0
+    /// 本机估算等效 API 价值（USD）
+    var localCost: Double = 0.0
+}
+
+/// 账号级官方计费/跨设备云端用量汇总
+struct CloudBillingSummary: Codable, Sendable, Equatable {
+    /// 数据源说明（如 "小米官方计费"、"Wham 官方多端"、"MiniMax 官方账单"、"Cloud Code 官方配额"、"Kimi 官方配额"）
+    var sourceName: String
+    /// 官方云端今日 Token（跨所有设备/API/网页端）
+    var todayTokens: Int? = nil
+    /// 官方云端今日请求数
+    var todayRequests: Int? = nil
+    /// 官方云端今日花费或积分文本（如 "¥1.20"、"1.6 cr"）
+    var todaySpendText: String? = nil
+    /// 官方统计周期名称（如 "本月云端"、"近30d云端"、"官方账单"）
+    var periodLabel: String? = nil
+    /// 官方统计周期总 Token（跨所有设备）
+    var periodTokens: Int? = nil
+    /// 官方统计周期总请求数
+    var periodRequests: Int? = nil
+    /// 官方统计周期总花费或积分文本（如 "¥0.38"、"74.3 cr"、"$12.40"）
+    var periodSpendText: String? = nil
+    /// 多端来源分布摘要（如 Codex "CLI 56% · Desktop 44%"、Kimi "月池 Kimi 12% · Code 8%"）
+    var surfaceSummary: String? = nil
+    /// 官方接口返回的分模型使用/配额明细
+    var models: [ModelUsageItem] = []
+
+    var hasHeadlineActivity: Bool {
+        (todayTokens ?? 0) > 0
+            || (periodTokens ?? 0) > 0
+            || (todaySpendText?.isEmpty == false)
+            || (periodSpendText?.isEmpty == false)
+            || (surfaceSummary?.isEmpty == false)
+    }
+}
+
 struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var id: String
     var provider: TrackedProvider
@@ -326,6 +406,7 @@ struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var walletBalanceText: String? = nil
     var resetCreditsText: String? = nil
     var todayTokens: Int
+    var localTodayTokens: Int? = nil
     var todayCost: Double
     var allTimeTokens: Int
     var allTimeCost: Double
@@ -334,7 +415,13 @@ struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var tokensPerSecond: Double? = nil
     var latestTokensPerSecond: Double? = nil
     var speedIsToday: Bool = true
+    var cloudBilling: CloudBillingSummary? = nil
+    var modelUsages: [ModelUsageItem]? = nil
     var updatedAt: Date
+
+    var resolvedModelUsages: [ModelUsageItem] {
+        modelUsages ?? cloudBilling?.models ?? []
+    }
 }
 
 struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
@@ -342,6 +429,7 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
     var provider: TrackedProvider
     var accounts: [AccountUsageSnapshot]
     var todayTokens: Int
+    var localTodayTokens: Int? = nil
     var todayCost: Double
     var allTimeTokens: Int
     var allTimeCost: Double
@@ -350,6 +438,7 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
     var tokensPerSecond: Double? = nil
     var latestTokensPerSecond: Double? = nil
     var speedIsToday: Bool = true
+    var modelUsages: [ModelUsageItem]? = nil
 
     /// 用于右侧边缘停靠条 (Edge Dock) 展示该平台当前剩余配额环形图百分比（0...100）
     var representativeRemainingPercent: Double? {

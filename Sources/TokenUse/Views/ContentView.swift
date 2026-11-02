@@ -685,6 +685,7 @@ private struct ProviderSectionCard: View {
                         .help(SpeedFormatter.tooltip(average: tps, latest: group.latestTokensPerSecond, isToday: group.speedIsToday))
                     }
 
+                    let groupCloudPeriodTokens = group.accounts.reduce(0) { $0 + ($1.cloudBilling?.periodTokens ?? 0) }
                     if group.todayTokens > 0 || group.allTimeTokens > 0 {
                         HStack(spacing: 5) {
                             Text("今日 \(NumberFormatterUtil.formatCompact(group.todayTokens))")
@@ -702,6 +703,18 @@ private struct ProviderSectionCard: View {
                         .font(.system(size: 11, weight: .medium, design: .rounded))
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
+                        .help(groupHeaderTokensTooltip)
+                    } else if groupCloudPeriodTokens > 0 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "icloud.fill")
+                                .font(.system(size: 9))
+                            Text("云端 \(NumberFormatterUtil.formatCompact(groupCloudPeriodTokens))")
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color(.sRGB, red: 0.58, green: 0.86, blue: 1.0).opacity(0.9))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .help("来自官方计费接口的跨设备云端 Token 用量（本机近 90 天无本地会话日志）")
                     }
 
                     Button(action: onAddAccount) {
@@ -729,6 +742,7 @@ private struct ProviderSectionCard: View {
                             account: account,
                             accent: group.provider.accentColor,
                             showInlineSpeed: group.accounts.count > 1,
+                            showEstimatedCost: showEstimatedCost,
                             isSwitching: switchingAccountId == account.id,
                             onBindXiaomiCookie: { onBindXiaomiCookie(account.id) },
                             onSwitchCodexAccount: { onSwitchCodexAccount(account.id) }
@@ -746,6 +760,14 @@ private struct ProviderSectionCard: View {
                         .stroke(.white.opacity(0.13), lineWidth: 0.8)
                 )
         )
+    }
+
+    private var groupHeaderTokensTooltip: String {
+        let localToday = group.localTodayTokens ?? group.todayTokens
+        if group.todayTokens > localToday {
+            return "今日已融合官方计费接口跨设备消耗（官方云端 \(NumberFormatterUtil.formatCompact(group.todayTokens)) · 本机会话 \(NumberFormatterUtil.formatCompact(localToday))）"
+        }
+        return "本机会话统计：今日 \(NumberFormatterUtil.formatCompact(group.todayTokens)) · 近 90 天 \(NumberFormatterUtil.formatCompact(group.allTimeTokens))"
     }
 
     private var emptyProviderRow: some View {
@@ -797,16 +819,42 @@ private struct AccountQuotaCard: View {
     let account: AccountUsageSnapshot
     let accent: Color
     let showInlineSpeed: Bool
+    let showEstimatedCost: Bool
     let isSwitching: Bool
     let onBindXiaomiCookie: () -> Void
     let onSwitchCodexAccount: () -> Void
 
     @State private var showBreakdown = false
+    @State private var showAllModels = false
 
     private let gridColumns = [
         GridItem(.flexible(), spacing: 10, alignment: .top),
         GridItem(.flexible(), spacing: 10, alignment: .top),
     ]
+
+    private var modelList: [ModelUsageItem] {
+        account.resolvedModelUsages
+    }
+
+    private var canExpandDetails: Bool {
+        account.todayTokens > 0
+            || account.allTimeTokens > 0
+            || !modelList.isEmpty
+            || (account.cloudBilling?.hasHeadlineActivity == true)
+    }
+
+    private var headerSummaryButtonText: String {
+        if account.todayTokens > 0 || account.allTimeTokens > 0 {
+            return "今日 \(NumberFormatterUtil.formatCompact(account.todayTokens)) · 90d \(NumberFormatterUtil.formatCompact(account.allTimeTokens))"
+        }
+        if let cb = account.cloudBilling, let pTok = cb.periodTokens, pTok > 0 {
+            return "\(cb.periodLabel ?? "云端") \(NumberFormatterUtil.formatCompact(pTok))"
+        }
+        if let cb = account.cloudBilling, let pSpend = cb.periodSpendText, !pSpend.isEmpty {
+            return "\(cb.periodLabel ?? "云端") \(pSpend)"
+        }
+        return "模型明细 (\(modelList.count))"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -946,14 +994,14 @@ private struct AccountQuotaCard: View {
                     .help(SpeedFormatter.tooltip(average: acctTps, latest: account.latestTokensPerSecond, isToday: account.speedIsToday))
                 }
 
-                if account.todayTokens > 0 || account.allTimeTokens > 0 {
+                if canExpandDetails {
                     Button {
                         withAnimation(.easeInOut(duration: 0.16)) {
                             showBreakdown.toggle()
                         }
                     } label: {
                         HStack(spacing: 3) {
-                            Text("今日 \(NumberFormatterUtil.formatCompact(account.todayTokens)) · 90d \(NumberFormatterUtil.formatCompact(account.allTimeTokens))")
+                            Text(headerSummaryButtonText)
                                 .font(.system(size: 10.5, weight: .medium, design: .rounded))
                             Image(systemName: showBreakdown ? "chevron.up" : "chevron.down")
                                 .font(.system(size: 8.5, weight: .bold))
@@ -962,7 +1010,7 @@ private struct AccountQuotaCard: View {
                         .lineLimit(1)
                     }
                     .buttonStyle(.plain)
-                    .help("点击展开/收起该账号缓存命中率与输入/输出/推理 Token 明细")
+                    .help("点击展开/收起官方计费跨端核对、分模型使用情况与缓存命中明细")
                 }
             }
 
@@ -999,8 +1047,18 @@ private struct AccountQuotaCard: View {
                 }
             }
 
-            if showBreakdown, let b = account.allTimeBreakdown ?? account.todayBreakdown, b.totalTokens > 0 {
-                tokenBreakdownFooter(breakdown: b, todayBreakdown: account.todayBreakdown)
+            // 官方计费与多端消耗核对摘要条（存在跨端活跃度或账单记录时单行呈现，点击直接展开分模型明细）
+            if let cb = account.cloudBilling, cb.hasHeadlineActivity {
+                cloudBillingStrip(cb)
+            }
+
+            if showBreakdown {
+                if !modelList.isEmpty {
+                    modelUsagesPanel(models: modelList)
+                }
+                if let b = account.allTimeBreakdown ?? account.todayBreakdown, b.totalTokens > 0 {
+                    tokenBreakdownFooter(breakdown: b, todayBreakdown: account.todayBreakdown)
+                }
             }
         }
         .padding(.horizontal, 11)
@@ -1018,6 +1076,245 @@ private struct AccountQuotaCard: View {
                         )
                 )
         )
+    }
+
+    private func cloudBillingStrip(_ cb: CloudBillingSummary) -> some View {
+        let segments: [String] = {
+            var parts: [String] = []
+            if let tTok = cb.todayTokens, tTok > 0 {
+                if let tSpend = cb.todaySpendText, !tSpend.isEmpty {
+                    parts.append("今日 \(NumberFormatterUtil.formatCompact(tTok)) (\(tSpend))")
+                } else {
+                    parts.append("今日 \(NumberFormatterUtil.formatCompact(tTok))")
+                }
+            } else if let tSpend = cb.todaySpendText, !tSpend.isEmpty {
+                parts.append("今日 \(tSpend)")
+            }
+
+            if let pTok = cb.periodTokens, pTok > 0 {
+                let pTitle = cb.periodLabel ?? "周期"
+                if let pSpend = cb.periodSpendText, !pSpend.isEmpty {
+                    parts.append("\(pTitle) \(NumberFormatterUtil.formatCompact(pTok)) · \(pSpend)")
+                } else {
+                    parts.append("\(pTitle) \(NumberFormatterUtil.formatCompact(pTok))")
+                }
+            } else if let pSpend = cb.periodSpendText, !pSpend.isEmpty {
+                parts.append("\(cb.periodLabel ?? "周期") \(pSpend)")
+            } else if let pReq = cb.periodRequests, pReq > 0 {
+                parts.append("\(cb.periodLabel ?? "请求") \(pReq) 次")
+            }
+
+            if let surf = cb.surfaceSummary, !surf.isEmpty {
+                parts.append(surf)
+            }
+            return parts
+        }()
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                showBreakdown.toggle()
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "icloud.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(accent.opacity(0.95))
+
+                Text(cb.sourceName)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.82))
+                    .fixedSize(horizontal: true, vertical: false)
+
+                if !segments.isEmpty {
+                    Text("·")
+                        .foregroundStyle(.white.opacity(0.28))
+                    Text(segments.joined(separator: " · "))
+                        .font(.system(size: 10, weight: .regular, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.68))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+
+                Spacer(minLength: 4)
+
+                if !modelList.isEmpty {
+                    HStack(spacing: 2.5) {
+                        Text("\(modelList.count) 个模型")
+                            .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        Image(systemName: showBreakdown ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 7.5, weight: .bold))
+                    }
+                    .foregroundStyle(accent.opacity(0.92))
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4.5)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(accent.opacity(0.07))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(accent.opacity(0.18), lineWidth: 0.5)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("官方计费/配额接口返回的全端消耗（含其他设备、Web/App 及 API 调用），点击查看分模型明细")
+    }
+
+    private func modelUsagesPanel(models: [ModelUsageItem]) -> some View {
+        let maxCollapsedCount = 6
+        let visibleModels = (showAllModels || models.count <= maxCollapsedCount)
+            ? models
+            : Array(models.prefix(maxCollapsedCount))
+
+        return VStack(alignment: .leading, spacing: 4.5) {
+            HStack(spacing: 6) {
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(accent.opacity(0.9))
+                Text("分模型使用与官方计费核对")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+                Spacer()
+                if let src = account.cloudBilling?.sourceName {
+                    Text("\(src) + 本机日志")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.white.opacity(0.45))
+                } else {
+                    Text("仅本机近 90 天会话日志")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+            }
+
+            ForEach(visibleModels) { item in
+                modelUsageRow(item)
+            }
+
+            if models.count > maxCollapsedCount {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.14)) {
+                        showAllModels.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(showAllModels ? "收起部分模型" : "查看全部 \(models.count) 个模型")
+                        Image(systemName: showAllModels ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 7.5, weight: .bold))
+                    }
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.54))
+                    .padding(.top, 1)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(.white.opacity(0.07), lineWidth: 0.5)
+                )
+        )
+    }
+
+    private func modelUsageRow(_ item: ModelUsageItem) -> some View {
+        let badgeColor: Color = {
+            switch item.origin {
+            case .officialCloud:
+                return Color(.sRGB, red: 0.45, green: 0.80, blue: 1.0)
+            case .merged:
+                return Color(.sRGB, red: 0.40, green: 0.92, blue: 0.70)
+            case .localOnly:
+                return .white.opacity(0.55)
+            }
+        }()
+
+        return HStack(spacing: 5) {
+            Text(item.modelName)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.90))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Text(item.origin.badgeText)
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle(badgeColor)
+                .padding(.horizontal, 4.5)
+                .padding(.vertical, 1)
+                .background(
+                    Capsule()
+                        .fill(badgeColor.opacity(0.13))
+                )
+                .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 4)
+
+            HStack(spacing: 5) {
+                if let cPeriod = item.cloudPeriodTokens, cPeriod > 0 {
+                    let prefix = (item.cloudTodayTokens ?? 0) > 0
+                        ? "今日 \(NumberFormatterUtil.formatCompact(item.cloudTodayTokens!)) · "
+                        : ""
+                    Text("\(prefix)\(item.cloudPeriodLabel ?? "云端") \(NumberFormatterUtil.formatCompact(cPeriod))")
+                        .foregroundStyle(Color(.sRGB, red: 0.68, green: 0.88, blue: 1.0))
+                } else if let cToday = item.cloudTodayTokens, cToday > 0 {
+                    Text("云端今日 \(NumberFormatterUtil.formatCompact(cToday))")
+                        .foregroundStyle(Color(.sRGB, red: 0.68, green: 0.88, blue: 1.0))
+                }
+
+                if let reqs = item.cloudRequests, reqs > 0 {
+                    Text("\(reqs)次")
+                        .foregroundStyle(.white.opacity(0.52))
+                }
+
+                if let spend = item.cloudSpendText, !spend.isEmpty {
+                    Text(spend)
+                        .fontWeight(.medium)
+                        .foregroundStyle(Color(.sRGB, red: 0.98, green: 0.82, blue: 0.48))
+                }
+
+                if let qText = item.cloudQuotaText, !qText.isEmpty {
+                    Text(qText)
+                        .foregroundStyle(modelQuotaColor(usedPercent: item.cloudUsedPercent))
+                }
+
+                if item.localAllTimeTokens > 0 || item.localTodayTokens > 0 {
+                    if item.origin == .merged {
+                        Text("本机90d \(NumberFormatterUtil.formatCompact(item.localAllTimeTokens))")
+                            .foregroundStyle(.white.opacity(0.58))
+                    } else if item.localTodayTokens > 0 {
+                        Text("今日 \(NumberFormatterUtil.formatCompact(item.localTodayTokens)) · 90d \(NumberFormatterUtil.formatCompact(item.localAllTimeTokens))")
+                            .foregroundStyle(.white.opacity(0.68))
+                    } else {
+                        Text("90d \(NumberFormatterUtil.formatCompact(item.localAllTimeTokens))")
+                            .foregroundStyle(.white.opacity(0.64))
+                    }
+
+                    if showEstimatedCost && item.localCost >= 0.01 && item.cloudSpendText == nil {
+                        Text(NumberFormatterUtil.formatCurrency(item.localCost))
+                            .foregroundStyle(Color(.sRGB, red: 0.46, green: 0.92, blue: 0.68).opacity(0.88))
+                            .help("本机日志按 API 单价折算等效价值")
+                    }
+                }
+            }
+            .font(.system(size: 10, weight: .regular, design: .rounded))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private func modelQuotaColor(usedPercent: Double?) -> Color {
+        guard let usedPercent else { return .white.opacity(0.58) }
+        let rem = max(0, 100 - usedPercent)
+        if rem <= 10 { return Color(.sRGB, red: 1.0, green: 0.45, blue: 0.45) }
+        if rem <= 30 { return .orange }
+        return Color(.sRGB, red: 0.44, green: 0.92, blue: 0.68)
     }
 
     private func tokenBreakdownFooter(

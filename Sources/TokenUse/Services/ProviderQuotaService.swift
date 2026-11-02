@@ -10,6 +10,7 @@ struct ProviderQuotaResult: Sendable {
     var windows: [QuotaWindow] = []
     var walletBalanceText: String? = nil
     var resetCreditsText: String? = nil
+    var cloudBilling: CloudBillingSummary? = nil
     var statusMessage: String?
     var errorMessage: String?
     var hasCustomConsoleAuth: Bool = false
@@ -118,7 +119,8 @@ actor ProviderQuotaService {
                     resolvedLabel: matched.email ?? matched.displayName ?? existing[account.id]?.resolvedLabel,
                     resolvedExternalId: matched.email ?? existing[account.id]?.resolvedExternalId,
                     planBadge: matched.tierName ?? existing[account.id]?.planBadge ?? "Antigravity",
-                    windows: matched.windows
+                    windows: matched.windows,
+                    cloudBilling: matched.cloudBilling ?? existing[account.id]?.cloudBilling
                 )
             }
         }
@@ -164,10 +166,10 @@ actor ProviderQuotaService {
             return fallbackCodexOffline(account: account, offlineSnapshots: offlineSnapshots, reason: "仅本地日志模式")
         }
         if account.authKind == .apiKey {
-            return fallbackCodexOffline(
+            return await fetchOpenAIAPIBillingQuota(
                 account: account,
-                offlineSnapshots: offlineSnapshots,
-                reason: "API Key 按量计费（无 5h/7d 订阅配额窗口）"
+                ephemeralSecrets: ephemeralSecrets,
+                offlineSnapshots: offlineSnapshots
             )
         }
 
@@ -190,9 +192,16 @@ actor ProviderQuotaService {
                     "originator": "Codex Desktop",
                 ]
             )
+            async let breakdownData = try? fetchCodexEndpointData(
+                url: endpoints.breakdownURL,
+                accessToken: auth.accessToken,
+                chatgptAccountId: auth.chatgptAccountId,
+                extraHeaders: [:]
+            )
 
             let (data, statusCode) = try await usagePair
             let rawResetCredits = await resetCreditsData
+            let rawBreakdown = await breakdownData
 
             guard (200..<300).contains(statusCode),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -209,6 +218,20 @@ actor ProviderQuotaService {
                 }
                 if let secondary = rateLimit["secondary_window"] as? [String: Any],
                    let win = buildCodexQuotaWindow(secondary, idPrefix: "codex.secondary", fallbackLabel: "7d 周限额") {
+                    windows.append(win)
+                }
+            }
+
+            // 若云端 GitHub Code Review 独立限额池有消耗，动态纳入进度窗口展示
+            if let cr = json["code_review_rate_limit"] as? [String: Any] {
+                if let primary = cr["primary_window"] as? [String: Any],
+                   doubleValue(primary["used_percent"]) > 0,
+                   let win = buildCodexQuotaWindow(primary, idPrefix: "codex.cr.p", fallbackLabel: "Code Review 5h", featurePrefix: "Code Review") {
+                    windows.append(win)
+                }
+                if let secondary = cr["secondary_window"] as? [String: Any],
+                   doubleValue(secondary["used_percent"]) > 0,
+                   let win = buildCodexQuotaWindow(secondary, idPrefix: "codex.cr.s", fallbackLabel: "Code Review 7d", featurePrefix: "Code Review") {
                     windows.append(win)
                 }
             }
@@ -254,6 +277,8 @@ actor ProviderQuotaService {
                 }
             }
 
+            let cloudBilling = buildCodexCloudBilling(usageJSON: json, breakdownPair: rawBreakdown)
+
             return ProviderQuotaResult(
                 resolvedLabel: auth.email,
                 resolvedExternalId: auth.chatgptAccountId,
@@ -261,6 +286,7 @@ actor ProviderQuotaService {
                 windows: windows,
                 walletBalanceText: walletText,
                 resetCreditsText: resetCouponText,
+                cloudBilling: cloudBilling,
                 statusMessage: windows.isEmpty ? "当前套餐暂无滚动速率限制" : nil
             )
         } catch {
@@ -271,6 +297,350 @@ actor ProviderQuotaService {
             }
             return ProviderQuotaResult(errorMessage: error.localizedDescription)
         }
+    }
+
+    private func buildCodexCloudBilling(
+        usageJSON: [String: Any],
+        breakdownPair: (data: Data, status: Int)?
+    ) -> CloudBillingSummary? {
+        struct CodexModelAcc {
+            var modelName: String
+            var todayCredits: Double = 0.0
+            var periodCredits: Double = 0.0
+            var hasFastSpeed: Bool = false
+            var throttledResetAt: Date? = nil
+            var isThrottled: Bool = false
+        }
+
+        var byModel: [String: CodexModelAcc] = [:]
+        var surfaceTotals: [String: Double] = [:]
+        var todayCreditsTotal = 0.0
+        var periodCreditsTotal = 0.0
+        let todayUTC = utcDateString()
+
+        if let pair = breakdownPair,
+           (200..<300).contains(pair.status),
+           let bdJSON = try? JSONSerialization.jsonObject(with: pair.data) as? [String: Any],
+           let days = bdJSON["data"] as? [[String: Any]] {
+            for day in days {
+                let dateStr = (day["date"] as? String) ?? ""
+                let isToday = (dateStr == todayUTC)
+
+                if let surfaces = day["product_surface_usage_values"] as? [String: Any] {
+                    for (surfKey, rawVal) in surfaces {
+                        let val = doubleValue(rawVal)
+                        guard val > 0.0001 else { continue }
+                        surfaceTotals[surfKey, default: 0.0] += val
+                    }
+                }
+
+                if let models = day["models"] as? [[String: Any]] {
+                    for m in models {
+                        let rawName = ((m["model"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !rawName.isEmpty else { continue }
+                        let cr = doubleValue(m["credits"])
+                        guard cr > 0.0001 else { continue }
+                        let speed = ((m["speed"] as? String) ?? "").lowercased()
+
+                        let key = rawName.lowercased()
+                        var acc = byModel[key] ?? CodexModelAcc(modelName: rawName)
+                        acc.periodCredits += cr
+                        periodCreditsTotal += cr
+                        if isToday {
+                            acc.todayCredits += cr
+                            todayCreditsTotal += cr
+                        }
+                        if speed == "fast" || speed == "priority" {
+                            acc.hasFastSpeed = true
+                        }
+                        byModel[key] = acc
+                    }
+                }
+            }
+        }
+
+        // 合并 `/wham/usage` 中的 `model_usage` 可用性状态（识别单模型限流锁定）
+        if let modelUsage = usageJSON["model_usage"] as? [String: Any] {
+            for (modelName, val) in modelUsage {
+                guard let info = val as? [String: Any] else { continue }
+                let available = (info["available"] as? Bool) ?? true
+                if !available {
+                    let key = modelName.lowercased()
+                    var acc = byModel[key] ?? CodexModelAcc(modelName: modelName)
+                    acc.isThrottled = true
+                    acc.throttledResetAt = epochSecondsDate(info["available_at"])
+                    byModel[key] = acc
+                }
+            }
+        }
+
+        let surfaceLabelMap: [String: String] = [
+            "cli": "CLI",
+            "desktop_app": "Desktop",
+            "work_desktop": "Work Desktop",
+            "vscode": "VS Code",
+            "jetbrains": "JetBrains",
+            "web": "Web",
+            "work_web": "Work Web",
+            "github": "GitHub",
+            "github_code_review": "Code Review",
+            "sdk": "SDK",
+            "exec": "Exec",
+            "mobile": "Mobile",
+            "work_mobile": "Mobile",
+            "slack": "Slack",
+            "linear": "Linear",
+            "agent_identity": "Agent",
+        ]
+
+        var mergedSurfaceByLabel: [String: Double] = [:]
+        var totalSurfaceSum = 0.0
+        for (rawSurf, val) in surfaceTotals where val > 0.001 {
+            if rawSurf == "unknown" { continue }
+            let friendly = surfaceLabelMap[rawSurf] ?? rawSurf
+            mergedSurfaceByLabel[friendly, default: 0.0] += val
+            totalSurfaceSum += val
+        }
+
+        let surfaceSummary: String? = {
+            guard totalSurfaceSum > 0.01 else { return nil }
+            let top = mergedSurfaceByLabel
+                .sorted { $0.value > $1.value }
+                .prefix(3)
+                .map { item -> String in
+                    let pct = min(100.0, max(1.0, (item.value / totalSurfaceSum) * 100.0))
+                    return String(format: "%@ %.0f%%", item.key, pct)
+                }
+            return top.isEmpty ? nil : "多端分布: " + top.joined(separator: " · ")
+        }()
+
+        let sortedModels = byModel.sorted { lhs, rhs in
+            if abs(lhs.value.periodCredits - rhs.value.periodCredits) > 0.001 {
+                return lhs.value.periodCredits > rhs.value.periodCredits
+            }
+            if lhs.value.isThrottled != rhs.value.isThrottled {
+                return lhs.value.isThrottled
+            }
+            return lhs.key < rhs.key
+        }
+
+        let modelItems: [ModelUsageItem] = sortedModels.map { (key, acc) in
+            var spendParts: [String] = []
+            if acc.todayCredits > 0.005 {
+                spendParts.append("今日 \(formatCreditUnits(acc.todayCredits))")
+            }
+            if acc.periodCredits > 0.005 {
+                spendParts.append("30d \(formatCreditUnits(acc.periodCredits))")
+            }
+            let spendText = spendParts.isEmpty ? nil : spendParts.joined(separator: " · ")
+
+            let quotaNote: String? = {
+                if acc.isThrottled { return "当前受限" }
+                if acc.hasFastSpeed { return "含 Fast 加速" }
+                return nil
+            }()
+
+            return ModelUsageItem(
+                id: "codex.model.\(key)",
+                modelName: acc.modelName,
+                origin: .officialCloud,
+                matchKey: key,
+                cloudSpendText: spendText,
+                cloudUsedPercent: acc.isThrottled ? 100.0 : nil,
+                cloudQuotaText: quotaNote,
+                cloudResetAt: acc.throttledResetAt
+            )
+        }
+
+        guard !modelItems.isEmpty
+            || periodCreditsTotal > 0.005
+            || surfaceSummary != nil else {
+            return nil
+        }
+
+        return CloudBillingSummary(
+            sourceName: "Codex 官方多端",
+            todaySpendText: todayCreditsTotal > 0.005 ? formatCreditUnits(todayCreditsTotal) : nil,
+            periodLabel: periodCreditsTotal > 0.005 ? "30d 多端" : nil,
+            periodSpendText: periodCreditsTotal > 0.005 ? formatCreditUnits(periodCreditsTotal) : nil,
+            surfaceSummary: surfaceSummary,
+            models: modelItems
+        )
+    }
+
+    /// 针对 OpenAI API Key (`sk-...` / `sk-admin-...`) 请求官方 Organization Usage / Costs 与 Credit Grants 接口
+    private func fetchOpenAIAPIBillingQuota(
+        account: ProviderAccountConfig,
+        ephemeralSecrets: [String: String],
+        offlineSnapshots: [String: OfflineCodexRateLimit]
+    ) async -> ProviderQuotaResult {
+        let offline = fallbackCodexOffline(
+            account: account,
+            offlineSnapshots: offlineSnapshots,
+            reason: "API Key 按量计费（无 5h/7d 订阅配额窗口）"
+        )
+        guard let apiKey = (KeychainStore.loadSecret(for: account.id) ?? ephemeralSecrets[account.id])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else {
+            return offline
+        }
+
+        let apiBase: String = {
+            if let custom = account.regionOrBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+               custom.lowercased().hasPrefix("http"),
+               !custom.lowercased().contains("chatgpt.com") {
+                var clean = custom.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                if !clean.hasSuffix("/v1") { clean += "/v1" }
+                return clean
+            }
+            return "https://api.openai.com/v1"
+        }()
+
+        let now = Date()
+        let start30d = Int(now.addingTimeInterval(-30 * 86400).timeIntervalSince1970)
+        let todayUTC = utcDateString(from: now)
+
+        async let usageRespTask = fetchOpenAIBearerData(
+            urlString: "\(apiBase)/organization/usage/completions?start_time=\(start30d)&bucket_width=1d&limit=31&group_by=model",
+            apiKey: apiKey
+        )
+        async let costsRespTask = fetchOpenAIBearerData(
+            urlString: "\(apiBase)/organization/costs?start_time=\(start30d)&bucket_width=1d&limit=31",
+            apiKey: apiKey
+        )
+
+        let usageRawData = await usageRespTask
+        let costsRawData = await costsRespTask
+        let usageJSON = usageRawData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let costsJSON = costsRawData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+
+        if usageJSON != nil || costsJSON != nil {
+            struct OpenAIAPIModelAcc {
+                var modelName: String
+                var todayTokens: Int = 0
+                var periodTokens: Int = 0
+                var requests: Int = 0
+            }
+            var byModel: [String: OpenAIAPIModelAcc] = [:]
+            var todayTokens = 0
+            var todayReqs = 0
+            var periodTokens = 0
+            var periodReqs = 0
+
+            if let buckets = usageJSON?["data"] as? [[String: Any]] {
+                for bucket in buckets {
+                    let st = doubleValue(bucket["start_time"])
+                    let isToday = st > 0 && (utcDateString(from: Date(timeIntervalSince1970: st)) == todayUTC)
+                    let results = (bucket["results"] as? [[String: Any]]) ?? []
+                    for r in results {
+                        let rawModel = ((r["model"] as? String) ?? "openai-api").trimmingCharacters(in: .whitespacesAndNewlines)
+                        let inTok = intValue(r["input_tokens"])
+                        let outTok = intValue(r["output_tokens"])
+                        let reqs = intValue(r["num_model_requests"])
+                        let tot = inTok + outTok
+                        guard tot > 0 || reqs > 0 else { continue }
+
+                        let key = rawModel.lowercased()
+                        var acc = byModel[key] ?? OpenAIAPIModelAcc(modelName: rawModel)
+                        acc.periodTokens += tot
+                        acc.requests += reqs
+                        periodTokens += tot
+                        periodReqs += reqs
+                        if isToday {
+                            acc.todayTokens += tot
+                            todayTokens += tot
+                            todayReqs += reqs
+                        }
+                        byModel[key] = acc
+                    }
+                }
+            }
+
+            var todayUSD = 0.0
+            var periodUSD = 0.0
+            if let costBuckets = costsJSON?["data"] as? [[String: Any]] {
+                for bucket in costBuckets {
+                    let st = doubleValue(bucket["start_time"])
+                    let isToday = st > 0 && (utcDateString(from: Date(timeIntervalSince1970: st)) == todayUTC)
+                    let results = (bucket["results"] as? [[String: Any]]) ?? []
+                    for r in results {
+                        let val = optionalDoubleValue((r["amount"] as? [String: Any])?["value"]) ?? 0.0
+                        periodUSD += val
+                        if isToday { todayUSD += val }
+                    }
+                }
+            }
+
+            let modelItems = byModel
+                .sorted { $0.value.periodTokens > $1.value.periodTokens }
+                .map { (key, acc) in
+                    ModelUsageItem(
+                        id: "openai.org.\(key)",
+                        modelName: acc.modelName,
+                        origin: .officialCloud,
+                        matchKey: key,
+                        cloudTodayTokens: acc.todayTokens > 0 ? acc.todayTokens : nil,
+                        cloudPeriodTokens: acc.periodTokens > 0 ? acc.periodTokens : nil,
+                        cloudPeriodLabel: acc.periodTokens > 0 ? "30d" : nil,
+                        cloudRequests: acc.requests > 0 ? acc.requests : nil
+                    )
+                }
+
+            let cloud = CloudBillingSummary(
+                sourceName: "OpenAI 官方账单",
+                todayTokens: todayTokens > 0 ? todayTokens : nil,
+                todayRequests: todayReqs > 0 ? todayReqs : nil,
+                todaySpendText: todayUSD > 0.0001 ? formatMoneyText(todayUSD, symbol: "$") : nil,
+                periodLabel: "30d 云端",
+                periodTokens: periodTokens > 0 ? periodTokens : nil,
+                periodRequests: periodReqs > 0 ? periodReqs : nil,
+                periodSpendText: periodUSD > 0.0001 ? formatMoneyText(periodUSD, symbol: "$") : nil,
+                models: modelItems
+            )
+
+            return ProviderQuotaResult(
+                planBadge: "API 按量",
+                windows: offline.windows,
+                walletBalanceText: periodUSD > 0.0001 ? "30d \(formatMoneyText(periodUSD, symbol: "$"))" : nil,
+                cloudBilling: cloud,
+                statusMessage: offline.windows.isEmpty ? "已同步 OpenAI Organization 官方计费明细" : nil
+            )
+        }
+
+        if let grantsData = await fetchOpenAIBearerData(
+            urlString: "\(apiBase)/dashboard/billing/credit_grants",
+            apiKey: apiKey
+        ), let grants = try? JSONSerialization.jsonObject(with: grantsData) as? [String: Any],
+           let avail = optionalDoubleValue(grants["total_available"]) {
+            let used = optionalDoubleValue(grants["total_used"]) ?? 0.0
+            return ProviderQuotaResult(
+                planBadge: "API 按量",
+                windows: offline.windows,
+                walletBalanceText: String(format: "余额 $%.2f", avail),
+                cloudBilling: used > 0.001 ? CloudBillingSummary(
+                    sourceName: "OpenAI 官方账单",
+                    periodLabel: "累计已用",
+                    periodSpendText: formatMoneyText(used, symbol: "$")
+                ) : nil,
+                statusMessage: offline.windows.isEmpty ? "已同步 OpenAI API 预付额度余额" : nil
+            )
+        }
+
+        return offline
+    }
+
+    private func fetchOpenAIBearerData(urlString: String, apiKey: String) async -> Data? {
+        guard let url = URL(string: urlString) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, resp) = try? await session.data(for: req),
+              let code = (resp as? HTTPURLResponse)?.statusCode,
+              (200..<300).contains(code) else {
+            return nil
+        }
+        return data
     }
 
     private func fetchCodexEndpointData(
@@ -386,7 +756,7 @@ actor ProviderQuotaService {
         }
     }
 
-    private func normalizedCodexEndpoints(customBase: String?) -> (usageURL: URL, resetCreditsURL: URL) {
+    private func normalizedCodexEndpoints(customBase: String?) -> (usageURL: URL, resetCreditsURL: URL, breakdownURL: URL) {
         let configuredBase: String? = {
             if let customBase, customBase.lowercased().hasPrefix("http") {
                 return customBase
@@ -400,25 +770,34 @@ actor ProviderQuotaService {
             return nil
         }()
 
-        if let raw = configuredBase?.trimmingCharacters(in: CharacterSet(charactersIn: "/")), !raw.isEmpty {
+        let defaultUsage = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+        let defaultReset = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
+        let defaultBreakdown = URL(string: "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown")!
+
+        if var raw = configuredBase?.trimmingCharacters(in: CharacterSet(charactersIn: "/")), !raw.isEmpty {
             if raw.contains("/backend-api") {
-                let u = URL(string: raw.hasSuffix("/usage") ? raw : "\(raw)/wham/usage")
-                    ?? URL(string: "https://chatgpt.com/backend-api/wham/usage")!
-                let rc = URL(string: "\(raw)/wham/rate-limit-reset-credits")
-                    ?? URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
-                return (u, rc)
+                if raw.hasSuffix("/wham/usage") {
+                    raw = String(raw.dropLast("/wham/usage".count))
+                } else if raw.hasSuffix("/usage") {
+                    raw = String(raw.dropLast("/usage".count))
+                }
+                let u = URL(string: "\(raw)/wham/usage") ?? defaultUsage
+                let rc = URL(string: "\(raw)/wham/rate-limit-reset-credits") ?? defaultReset
+                let bd = URL(string: "\(raw)/wham/usage/daily-token-usage-breakdown") ?? defaultBreakdown
+                return (u, rc, bd)
             } else {
-                let u = URL(string: raw.hasSuffix("/usage") ? raw : "\(raw)/api/codex/usage")
-                    ?? URL(string: "https://chatgpt.com/backend-api/wham/usage")!
-                let rc = URL(string: "\(raw)/api/codex/rate-limit-reset-credits")
-                    ?? URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
-                return (u, rc)
+                if raw.hasSuffix("/api/codex/usage") {
+                    raw = String(raw.dropLast("/api/codex/usage".count))
+                } else if raw.hasSuffix("/usage") {
+                    raw = String(raw.dropLast("/usage".count))
+                }
+                let u = URL(string: "\(raw)/api/codex/usage") ?? defaultUsage
+                let rc = URL(string: "\(raw)/api/codex/rate-limit-reset-credits") ?? defaultReset
+                let bd = URL(string: "\(raw)/api/codex/usage/daily-token-usage-breakdown") ?? defaultBreakdown
+                return (u, rc, bd)
             }
         }
-        return (
-            URL(string: "https://chatgpt.com/backend-api/wham/usage")!,
-            URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
-        )
+        return (defaultUsage, defaultReset, defaultBreakdown)
     }
 
     private struct ResolvedCodexAuth {
@@ -876,7 +1255,9 @@ actor ProviderQuotaService {
         var planBadge: String? = nil
         var walletBalanceText: String? = nil
         var resolvedLabel: String? = nil
+        var cloudBilling: CloudBillingSummary? = nil
         var consoleError: String? = nil
+        var didMintConsoleFail = false
 
         // 2. 开放平台控制台查询（支持直接 Cookie 或由 passToken 无感换取，401/46109 自动重换一次）
         do {
@@ -885,6 +1266,8 @@ actor ProviderQuotaService {
                 if let minted = await MimoSessionMinter.mintConsoleSession(seed: seed)?.cookieHeader {
                     cachedMiMoConsoleSessions[seedCacheKey] = minted
                     activeConsoleCookie = minted
+                } else {
+                    didMintConsoleFail = true
                 }
             }
 
@@ -911,6 +1294,7 @@ actor ProviderQuotaService {
                     let symbol = (snapshot.currency == "USD") ? "$" : "¥"
                     walletBalanceText = String(format: "余额 %@%.2f", symbol, bal)
                 }
+                cloudBilling = snapshot.cloudBilling
 
                 if snapshot.hasActivePlan, let pWin = snapshot.planWindow {
                     windows.append(pWin)
@@ -941,7 +1325,7 @@ actor ProviderQuotaService {
         }
 
         let hasCustomAuth = (rawManualCookie != nil)
-        if windows.isEmpty && walletBalanceText == nil, let consoleError {
+        if windows.isEmpty && walletBalanceText == nil && cloudBilling == nil, let consoleError {
             return ProviderQuotaResult(
                 resolvedLabel: resolvedLabel,
                 planBadge: planBadge ?? "MiMo",
@@ -950,15 +1334,22 @@ actor ProviderQuotaService {
             )
         }
 
-        let statusMsg: String? = windows.isEmpty
-            ? (walletBalanceText != nil ? "当前未开通活跃套餐 · 已同步开放平台余额" : "当前未开通活跃 Token Plan 套餐")
-            : nil
+        let statusMsg: String? = {
+            guard windows.isEmpty else { return nil }
+            if didMintConsoleFail && walletBalanceText == nil && cloudBilling == nil {
+                return "小米通行证会话已过期 · 请打开 Xiaomi MiMo 桌面端或在设置中登录小米控制台以同步官方套餐与计费明细"
+            }
+            return walletBalanceText != nil
+                ? "当前未开通活跃套餐 · 已同步开放平台余额"
+                : "当前未开通活跃 Token Plan 套餐"
+        }()
 
         return ProviderQuotaResult(
             resolvedLabel: resolvedLabel,
             planBadge: planBadge ?? "Token Plan",
             windows: windows,
             walletBalanceText: walletBalanceText,
+            cloudBilling: cloudBilling,
             statusMessage: statusMsg,
             hasCustomConsoleAuth: hasCustomAuth
         )
@@ -974,19 +1365,40 @@ actor ProviderQuotaService {
         var isExpiredPlan: Bool = false
         var planWindow: QuotaWindow?
         var compensationWindow: QuotaWindow?
+        var cloudBilling: CloudBillingSummary?
     }
 
     private func loadMiMoConsolePayload(cookie: String) async throws -> MiMoConsolePayload {
+        let now = Date()
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        let curYear = cal.component(.year, from: now)
+        let curMonth = cal.component(.month, from: now)
+
         async let balanceTask = fetchMiMoConsoleData(path: "/api/v1/balance", cookie: cookie)
         async let profileTask = try? fetchMiMoConsoleData(path: "/api/v1/userProfile", cookie: cookie)
         async let detailTask = try? fetchMiMoConsoleData(path: "/api/v1/tokenPlan/detail", cookie: cookie)
         async let usageTask = try? fetchMiMoConsoleData(path: "/api/v1/tokenPlan/usage", cookie: cookie)
+        async let overviewTask = try? fetchMiMoConsoleData(path: "/api/v1/usage", cookie: cookie)
+        async let planListTask = try? postMiMoConsoleData(
+            path: "/api/v1/usage/token-plan/list",
+            body: ["year": curYear, "month": curMonth],
+            cookie: cookie
+        )
+        async let detailListTask = try? postMiMoConsoleData(
+            path: "/api/v1/usage/detail/list",
+            body: ["year": curYear, "month": curMonth],
+            cookie: cookie
+        )
 
         // /balance 兼具会话有效性探测与钱包余额读取
         let balanceData = try await balanceTask
         let profileData = await profileTask
         let detailDataRaw = await detailTask
         let usageDataRaw = await usageTask
+        let overviewDataRaw = await overviewTask
+        let planListDataRaw = await planListTask
+        let detailListDataRaw = await detailListTask
 
         guard let balanceJSON = try? JSONSerialization.jsonObject(with: balanceData) as? [String: Any] else {
             throw QuotaError.invalidResponse("MiMo balance 响应解析失败")
@@ -994,6 +1406,7 @@ actor ProviderQuotaService {
         let profileJSON = profileData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let detailJSON = detailDataRaw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let usageJSON = usageDataRaw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let overviewJSON = overviewDataRaw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
 
         var out = MiMoConsolePayload()
         let balData = (balanceJSON["data"] as? [String: Any]) ?? balanceJSON
@@ -1014,7 +1427,6 @@ actor ProviderQuotaService {
             if let email, !email.isEmpty { out.email = email }
         }
 
-        let now = Date()
         var periodEnd: Date? = nil
         var detailActive = false
         var detailExpired = false
@@ -1058,6 +1470,7 @@ actor ProviderQuotaService {
         }
 
         out.planLabel = detailLabel
+        var planUsedTokens = 0
 
         // 解析 /tokenPlan/usage：兼容新版 data.monthUsage.items (month_total_token) 与旧版 data.usage.items (plan_total_token)
         if let usageData = (usageJSON?["data"] as? [String: Any]) ?? usageJSON {
@@ -1085,6 +1498,7 @@ actor ProviderQuotaService {
                 let usedInt = Int(used ?? 0)
 
                 if totalNames.contains(name), limitInt > 0 {
+                    planUsedTokens = max(planUsedTokens, usedInt)
                     let detail = "\(NumberFormatterUtil.formatCompact(usedInt)) / \(NumberFormatterUtil.formatCompact(limitInt))"
                     let winLabel = name.contains("month") ? "月度套餐额度" : "套餐总额度"
                     matchedPlanWindow = QuotaWindow(
@@ -1111,11 +1525,13 @@ actor ProviderQuotaService {
                 let limit = optionalDoubleValue(container["limit"])
                 if let limit, limit > 0,
                    let usedPct = normalizeMiMoRatioPercent(rawPercent: container["percent"], used: used, limit: limit) {
+                    let usedInt = Int(used ?? 0)
+                    planUsedTokens = max(planUsedTokens, usedInt)
                     matchedPlanWindow = QuotaWindow(
                         id: "mimo.plan_total",
                         label: "月度套餐额度",
                         usedPercent: usedPct,
-                        detailText: "\(NumberFormatterUtil.formatCompact(Int(used ?? 0))) / \(NumberFormatterUtil.formatCompact(Int(limit)))",
+                        detailText: "\(NumberFormatterUtil.formatCompact(usedInt)) / \(NumberFormatterUtil.formatCompact(Int(limit)))",
                         resetAt: periodEnd
                     )
                 }
@@ -1135,7 +1551,222 @@ actor ProviderQuotaService {
             }
         }
 
+        // 解析官方分模型计费明细（若月初当月尚无记录，自动补查上一自然月以覆盖跨月订阅周期）
+        var planRows = extractMiMoUsageRows(from: planListDataRaw)
+        var detailRows = extractMiMoUsageRows(from: detailListDataRaw)
+        var monthTag = "本月"
+
+        if planRows.isEmpty && detailRows.isEmpty {
+            let prevYear = (curMonth == 1) ? (curYear - 1) : curYear
+            let prevMonth = (curMonth == 1) ? 12 : (curMonth - 1)
+            async let prevPlanTask = try? postMiMoConsoleData(
+                path: "/api/v1/usage/token-plan/list",
+                body: ["year": prevYear, "month": prevMonth],
+                cookie: cookie
+            )
+            async let prevDetailTask = try? postMiMoConsoleData(
+                path: "/api/v1/usage/detail/list",
+                body: ["year": prevYear, "month": prevMonth],
+                cookie: cookie
+            )
+            let prevPlan = extractMiMoUsageRows(from: await prevPlanTask)
+            let prevDetail = extractMiMoUsageRows(from: await prevDetailTask)
+            if !prevPlan.isEmpty || !prevDetail.isEmpty {
+                planRows = prevPlan
+                detailRows = prevDetail
+                monthTag = "上月"
+            }
+        }
+
+        out.cloudBilling = buildMiMoCloudBilling(
+            overviewJSON: overviewJSON,
+            planRows: planRows,
+            detailRows: detailRows,
+            monthTag: monthTag,
+            planUsedTokens: planUsedTokens,
+            currency: out.currency,
+            now: now
+        )
+
         return out
+    }
+
+    private func extractMiMoUsageRows(from data: Data?) -> [[String: Any]] {
+        guard let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        if let arr = json["data"] as? [[String: Any]] {
+            return arr
+        }
+        if let nested = (json["data"] as? [String: Any])?["list"] as? [[String: Any]] {
+            return nested
+        }
+        return []
+    }
+
+    private func buildMiMoCloudBilling(
+        overviewJSON: [String: Any]?,
+        planRows: [[String: Any]],
+        detailRows: [[String: Any]],
+        monthTag: String,
+        planUsedTokens: Int,
+        currency: String,
+        now: Date
+    ) -> CloudBillingSummary? {
+        let sym = (currency == "USD") ? "$" : "¥"
+        let todayStr = localDateString(from: now)
+
+        struct MiMoModelAcc {
+            var modelName: String
+            var todayTokens: Int = 0
+            var periodTokens: Int = 0
+            var requests: Int = 0
+            var spend: Double = 0.0
+        }
+
+        var byModel: [String: MiMoModelAcc] = [:]
+        var seenPlanSignatures: Set<String> = []
+        var todayTokens = 0
+        var todayRequests = 0
+        var todaySpend = 0.0
+        var monthTokens = 0
+        var monthRequests = 0
+        var monthSpend = 0.0
+
+        for row in planRows {
+            let model = ((row["model"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else { continue }
+            let dateStr = String(((row["date"] as? String) ?? "").prefix(10))
+            let tok = max(
+                intValue(row["totalToken"]),
+                intValue(row["inputHitToken"]) + intValue(row["inputMissToken"]) + intValue(row["outputToken"])
+            )
+            let reqs = intValue(row["requestCount"])
+            seenPlanSignatures.insert("\(dateStr)|\(model.lowercased())|\(tok)|\(reqs)")
+
+            let key = model.lowercased()
+            var acc = byModel[key] ?? MiMoModelAcc(modelName: model)
+            acc.periodTokens += tok
+            acc.requests += reqs
+            monthTokens += tok
+            monthRequests += reqs
+            if dateStr == todayStr {
+                acc.todayTokens += tok
+                todayTokens += tok
+                todayRequests += reqs
+            }
+            byModel[key] = acc
+        }
+
+        for row in detailRows {
+            let model = ((row["model"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else { continue }
+            let dateStr = String(((row["date"] as? String) ?? "").prefix(10))
+            let tok = max(
+                intValue(row["totalToken"]),
+                intValue(row["inputHitToken"]) + intValue(row["inputMissToken"]) + intValue(row["outputToken"])
+            )
+            let reqs = intValue(row["requestCount"])
+            let amount = optionalDoubleValue(row["consumedAmount"]) ?? 0.0
+            let sig = "\(dateStr)|\(model.lowercased())|\(tok)|\(reqs)"
+            if amount <= 0.000001 && seenPlanSignatures.contains(sig) {
+                continue
+            }
+
+            let key = model.lowercased()
+            var acc = byModel[key] ?? MiMoModelAcc(modelName: model)
+            acc.periodTokens += tok
+            acc.requests += reqs
+            acc.spend += amount
+            monthTokens += tok
+            monthRequests += reqs
+            monthSpend += amount
+            if dateStr == todayStr {
+                acc.todayTokens += tok
+                todayTokens += tok
+                todayRequests += reqs
+                todaySpend += amount
+            }
+            byModel[key] = acc
+        }
+
+        let overviewData = (overviewJSON?["data"] as? [String: Any]) ?? overviewJSON
+        let overviewCost = optionalDoubleValue((overviewData?["costUsage"] as? [String: Any])?["totalCost"]) ?? 0.0
+        let overviewTokens = intValue((overviewData?["tokenUsage"] as? [String: Any])?["totalToken"])
+        let pluginObj = overviewData?["pluginUsage"] as? [String: Any]
+        let pluginReqs = intValue(pluginObj?["totalRequestCount"])
+        let webSearchReqs = intValue(pluginObj?["webSearchRequestCount"])
+
+        let sortedModels = byModel.sorted { lhs, rhs in
+            if lhs.value.periodTokens != rhs.value.periodTokens {
+                return lhs.value.periodTokens > rhs.value.periodTokens
+            }
+            return lhs.value.requests > rhs.value.requests
+        }
+
+        let modelItems: [ModelUsageItem] = sortedModels.map { (key, acc) in
+            ModelUsageItem(
+                id: "mimo.model.\(key)",
+                modelName: acc.modelName,
+                origin: .officialCloud,
+                matchKey: key,
+                cloudTodayTokens: acc.todayTokens > 0 ? acc.todayTokens : nil,
+                cloudPeriodTokens: acc.periodTokens > 0 ? acc.periodTokens : nil,
+                cloudPeriodLabel: acc.periodTokens > 0 ? monthTag : nil,
+                cloudRequests: acc.requests > 0 ? acc.requests : nil,
+                cloudSpendText: acc.spend > 0.0001 ? formatMoneyText(acc.spend, symbol: sym) : nil
+            )
+        }
+
+        var surfaceParts: [String] = []
+        let periodLabel: String?
+        let periodTokens: Int?
+
+        if planUsedTokens > monthTokens {
+            periodLabel = "套餐云端"
+            periodTokens = planUsedTokens
+            if monthTokens > 0 {
+                surfaceParts.append("\(monthTag)明细 \(NumberFormatterUtil.formatCompact(monthTokens))")
+            }
+        } else if monthTokens > 0 {
+            periodLabel = "\(monthTag)云端"
+            periodTokens = monthTokens
+        } else if overviewTokens > 0 {
+            periodLabel = "官方云端"
+            periodTokens = overviewTokens
+        } else {
+            periodLabel = nil
+            periodTokens = nil
+        }
+
+        if webSearchReqs > 0 {
+            surfaceParts.append("联网搜索 \(webSearchReqs) 次")
+        }
+
+        let effectiveSpend = max(monthSpend, overviewCost)
+        let effectiveReqs = monthRequests > 0 ? monthRequests : (pluginReqs > 0 ? pluginReqs : nil)
+        let surfaceSummary = surfaceParts.isEmpty ? nil : surfaceParts.joined(separator: " · ")
+
+        guard !modelItems.isEmpty
+            || (periodTokens ?? 0) > 0
+            || effectiveSpend > 0.0001
+            || surfaceSummary != nil else {
+            return nil
+        }
+
+        return CloudBillingSummary(
+            sourceName: "小米官方计费",
+            todayTokens: todayTokens > 0 ? todayTokens : nil,
+            todayRequests: todayRequests > 0 ? todayRequests : nil,
+            todaySpendText: todaySpend > 0.0001 ? formatMoneyText(todaySpend, symbol: sym) : nil,
+            periodLabel: periodLabel,
+            periodTokens: periodTokens,
+            periodRequests: effectiveReqs,
+            periodSpendText: effectiveSpend > 0.0001 ? formatMoneyText(effectiveSpend, symbol: sym) : nil,
+            surfaceSummary: surfaceSummary,
+            models: modelItems
+        )
     }
 
     /// MiMo 接口中的 `percent` 始终为 0..1 比例（超额时如 1.005 代表 100.5% 已耗尽，绝不可误判为 1.005%！）
@@ -1223,6 +1854,49 @@ actor ProviderQuotaService {
         }
         let bodyCode = intValue(json["code"], default: 0)
         // 46109 为小米网关在 HTTP 200 下返回的未登录/Token 失效状态码
+        if bodyCode == 401 || bodyCode == 403 || bodyCode == 46109 {
+            throw QuotaError.authFailed((json["message"] as? String) ?? "小米控制台鉴权失效 (\(bodyCode))")
+        }
+        if json["code"] != nil && bodyCode != 0 {
+            throw QuotaError.invalidResponse((json["message"] as? String) ?? "MiMo code=\(bodyCode)")
+        }
+        return data
+    }
+
+    /// 小米开放平台控制台 POST 请求（必须从 Cookie 提取 `api-platform_ph` 作为 Query CSRF 参数并附带 `x-timeZone`）
+    private func postMiMoConsoleData(path: String, body: [String: Any], cookie: String) async throws -> Data {
+        let phQuery: String
+        if let ph = MimoSessionMinter.parseCookiePairs(cookie)["api-platform_ph"], !ph.isEmpty {
+            let sep = path.contains("?") ? "&" : "?"
+            phQuery = "\(sep)api-platform_ph=\(formEncode(ph))"
+        } else {
+            phQuery = ""
+        }
+        guard let url = URL(string: "https://platform.xiaomimimo.com\(path)\(phQuery)") else {
+            throw QuotaError.invalidResponse("小米接口地址无效")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue("https://platform.xiaomimimo.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://platform.xiaomimimo.com/#/console/usage", forHTTPHeaderField: "Referer")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "x-timeZone")
+        request.setValue(MimoSessionMinter.browserUserAgent, forHTTPHeaderField: "User-Agent")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await noRedirectSession.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 401 || status == 403 || (300..<400).contains(status) {
+            throw QuotaError.authFailed("小米控制台会话已过期 (HTTP \(status))")
+        }
+        guard (200..<300).contains(status),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw QuotaError.invalidResponse("小米接口返回 HTTP \(status)")
+        }
+        let bodyCode = intValue(json["code"], default: 0)
         if bodyCode == 401 || bodyCode == 403 || bodyCode == 46109 {
             throw QuotaError.authFailed((json["message"] as? String) ?? "小米控制台鉴权失效 (\(bodyCode))")
         }
@@ -1361,9 +2035,20 @@ actor ProviderQuotaService {
             let baseURL = normalizedKimiBaseURL(account.regionOrBaseURL)
             async let usagesTask = fetchKimiData(url: URL(string: "\(baseURL)/usages")!, token: token)
             async let meTask = try? fetchKimiData(url: URL(string: "\(baseURL)/me")!, token: token)
+            async let modelsTask = try? fetchKimiData(url: URL(string: "\(baseURL)/models")!, token: token)
 
-            let rawUsagesData = try await usagesTask
+            let rawUsagesData: Data
+            do {
+                rawUsagesData = try await usagesTask
+            } catch {
+                if token.hasPrefix("sk-"), !token.hasPrefix("sk-kimi-"),
+                   let openRes = await fetchMoonshotOpenPlatformQuota(apiKey: token, regionHint: account.regionOrBaseURL) {
+                    return openRes
+                }
+                throw error
+            }
             let rawMeData = await meTask
+            let rawModelsData = await modelsTask
 
             guard let usagesJSON = try? JSONSerialization.jsonObject(with: rawUsagesData) as? [String: Any] else {
                 throw QuotaError.invalidResponse("Kimi usages 响应解析失败")
@@ -1380,12 +2065,18 @@ actor ProviderQuotaService {
                 ?? (((usagesJSON["user"] as? [String: Any])?["membership"] as? [String: Any])?["level"] as? String)
 
             let windows = parseKimiUsageWindows(from: usagesJSON)
+            let cloudBilling = buildKimiCloudBilling(
+                usagesJSON: usagesJSON,
+                modelsData: rawModelsData,
+                sourceName: "Kimi 官方多端"
+            )
 
             return ProviderQuotaResult(
                 resolvedLabel: resolvedName,
                 resolvedExternalId: userId,
                 planBadge: (planBadge?.isEmpty == false) ? planBadge : "Kimi Code",
                 windows: windows,
+                cloudBilling: cloudBilling,
                 statusMessage: windows.isEmpty ? "已连接 Kimi Code（暂无配额窗口限制）" : nil
             )
         } catch {
@@ -1581,9 +2272,10 @@ actor ProviderQuotaService {
     }
 
     private func fetchKimiWebConsoleQuota(webToken: String) async throws -> ProviderQuotaResult {
-        async let usageTask = try? postKimiWebRPCData(
-            url: URL(string: "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages")!,
-            body: #"{"scope":["FEATURE_CODING"]}"#,
+        let billingURL = URL(string: "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages")!
+        async let multiScopeTask = try? postKimiWebRPCData(
+            url: billingURL,
+            body: #"{"scope":["FEATURE_CODING","FEATURE_KIMI","FEATURE_RESEARCH"]}"#,
             webToken: webToken
         )
         async let membershipTask = try? postKimiWebRPCData(
@@ -1592,7 +2284,14 @@ actor ProviderQuotaService {
             webToken: webToken
         )
 
-        let usageRaw = await usageTask
+        var usageRaw = await multiScopeTask
+        if usageRaw == nil {
+            usageRaw = try? await postKimiWebRPCData(
+                url: billingURL,
+                body: #"{"scope":["FEATURE_CODING"]}"#,
+                webToken: webToken
+            )
+        }
         let membershipRaw = await membershipTask
         let usageJSON = usageRaw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let membershipJSON = membershipRaw.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
@@ -1602,15 +2301,35 @@ actor ProviderQuotaService {
         }
 
         var byId: [String: QuotaWindow] = [:]
+        var webSurfaceParts: [String] = []
+        var webModelItems: [ModelUsageItem] = []
+
         if let usageJSON {
             let body = (usageJSON["data"] as? [String: Any]) ?? usageJSON
-            if let usages = body["usages"] as? [[String: Any]],
-               let coding = usages.first(where: { ($0["scope"] as? String) == "FEATURE_CODING" }) {
-                var synthetic: [String: Any] = [:]
-                if let d = coding["detail"] { synthetic["usage"] = d }
-                if let l = coding["limits"] { synthetic["limits"] = l }
-                for w in parseKimiUsageWindows(from: synthetic) {
-                    byId[w.id] = w
+            if let usages = body["usages"] as? [[String: Any]] {
+                if let coding = usages.first(where: { ($0["scope"] as? String) == "FEATURE_CODING" }) {
+                    var synthetic: [String: Any] = [:]
+                    if let d = coding["detail"] { synthetic["usage"] = d }
+                    if let l = coding["limits"] { synthetic["limits"] = l }
+                    for w in parseKimiUsageWindows(from: synthetic) {
+                        byId[w.id] = w
+                    }
+                }
+                for other in usages {
+                    guard let scope = other["scope"] as? String, scope != "FEATURE_CODING" else { continue }
+                    let detail = (other["detail"] as? [String: Any]) ?? other
+                    guard let parsed = parseKimiDetailPercent(detail) else { continue }
+                    let scopeTitle = scope == "FEATURE_RESEARCH" ? "Kimi 深度研究" : "Kimi 网页/App 对话"
+                    if parsed.usedPercent > 0.1 {
+                        webSurfaceParts.append("\(scopeTitle) \(parsed.detailText)")
+                    }
+                    webModelItems.append(ModelUsageItem(
+                        id: "kimi.web.\(scope.lowercased())",
+                        modelName: scopeTitle,
+                        origin: .officialCloud,
+                        cloudUsedPercent: parsed.usedPercent,
+                        cloudQuotaText: parsed.detailText
+                    ))
                 }
             }
         }
@@ -1643,32 +2362,45 @@ actor ProviderQuotaService {
                     resetAt: parseISO8601((r7d["resetTime"] as? String) ?? (r7d["reset_time"] as? String))
                 )
             }
-            if byId["kimi.month"] == nil,
-               let bal = (body["subscriptionBalance"] as? [String: Any]) ?? (body["subscription_balance"] as? [String: Any]),
+            if let bal = (body["subscriptionBalance"] as? [String: Any]) ?? (body["subscription_balance"] as? [String: Any]),
                let rawRatio = optionalDoubleValue(bal["amountUsedRatio"] ?? bal["amount_used_ratio"]), rawRatio >= 0 {
                 let rawUsedPct = rawRatio * 100.0
                 let clampedPct = min(100.0, max(0.0, rawUsedPct))
                 var detail = String(format: "剩余 %.0f%%", max(0, 100 - clampedPct))
                 if let codeRatio = optionalDoubleValue(bal["kimiCodeUsedRatio"] ?? bal["kimi_code_used_ratio"]), codeRatio >= 0 {
                     let safeCode = min(rawUsedPct, codeRatio * 100.0)
-                    detail = String(format: "Kimi %.0f%% · Code %.0f%%", max(0, rawUsedPct - safeCode), safeCode)
+                    let kimiPct = max(0, rawUsedPct - safeCode)
+                    detail = String(format: "Kimi %.0f%% · Code %.0f%%", kimiPct, safeCode)
+                    if rawUsedPct > 0.1 {
+                        webSurfaceParts.insert(String(format: "月池 Kimi %.1f%% · Code %.1f%%", kimiPct, safeCode), at: 0)
+                    }
                 }
-                byId["kimi.month"] = QuotaWindow(
-                    id: "kimi.month",
-                    label: "月度共享池",
-                    usedPercent: clampedPct,
-                    detailText: detail,
-                    resetAt: parseISO8601((bal["expireTime"] as? String) ?? (bal["expire_time"] as? String))
-                )
+                if byId["kimi.month"] == nil {
+                    byId["kimi.month"] = QuotaWindow(
+                        id: "kimi.month",
+                        label: "月度共享池",
+                        usedPercent: clampedPct,
+                        detailText: detail,
+                        resetAt: parseISO8601((bal["expireTime"] as? String) ?? (bal["expire_time"] as? String))
+                    )
+                }
             }
         }
 
         let ordered = ["kimi.5h", "kimi.7d", "kimi.month"].compactMap { byId[$0] }
         let claims = decodeJWTClaims(webToken)
+        let webCloud: CloudBillingSummary? = (!webSurfaceParts.isEmpty || !webModelItems.isEmpty)
+            ? CloudBillingSummary(
+                sourceName: "Kimi Web 官方配额",
+                surfaceSummary: webSurfaceParts.isEmpty ? nil : webSurfaceParts.joined(separator: " · "),
+                models: webModelItems
+            )
+            : nil
         return ProviderQuotaResult(
             resolvedExternalId: claims["sub"] as? String,
             planBadge: "Kimi Web",
             windows: ordered,
+            cloudBilling: webCloud,
             statusMessage: ordered.isEmpty ? "已连接 Kimi Web（暂无活跃配额限制）" : nil
         )
     }
@@ -1844,12 +2576,173 @@ actor ProviderQuotaService {
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("KimiCLI/2.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
             throw QuotaError.authFailed("Kimi 接口返回 HTTP \(status)")
         }
         return data
+    }
+
+    private func buildKimiCloudBilling(
+        usagesJSON: [String: Any],
+        modelsData: Data?,
+        sourceName: String
+    ) -> CloudBillingSummary? {
+        let body = (usagesJSON["data"] as? [String: Any]) ?? usagesJSON
+        var surfaceParts: [String] = []
+        var periodReqs: Int? = nil
+
+        if let usage = body["usage"] as? [String: Any] {
+            let used = optionalDoubleValue(usage["used"] ?? usage["usedValue"] ?? usage["used_value"])
+            let limit = optionalDoubleValue(usage["limit"] ?? usage["limitValue"] ?? usage["limit_value"])
+            if let used, let limit, limit > 0, used > 0 {
+                if Int(limit) != 100 {
+                    periodReqs = Int(used)
+                    surfaceParts.append("周额度 \(Int(used))/\(Int(limit))")
+                } else {
+                    surfaceParts.append(String(format: "周配额已用 %.0f%%", min(100, (used / limit) * 100)))
+                }
+            }
+        }
+
+        if let pools = body["usages"] as? [String: Any],
+           let lMonth = pools["limit_month_total"] as? [String: Any],
+           let rawRatio = optionalDoubleValue(lMonth["used_ratio"] ?? lMonth["usedRatio"]),
+           rawRatio > 0.001 {
+            let rawUsedPct = rawRatio * 100.0
+            if let lCode = pools["limit_month_code"] as? [String: Any],
+               let codeRatio = optionalDoubleValue(lCode["used_ratio"] ?? lCode["usedRatio"]),
+               codeRatio >= 0 {
+                let safeCodePct = min(rawUsedPct, codeRatio * 100.0)
+                let kimiWebPct = max(0.0, rawUsedPct - safeCodePct)
+                surfaceParts.append(String(format: "月池 Kimi %.1f%% · Code %.1f%%", kimiWebPct, safeCodePct))
+            } else {
+                surfaceParts.append(String(format: "月度共享池已用 %.1f%%", min(100, rawUsedPct)))
+            }
+        }
+
+        var modelItems: [ModelUsageItem] = []
+        if let modelsData,
+           let modelsJSON = try? JSONSerialization.jsonObject(with: modelsData) as? [String: Any],
+           let dataArr = modelsJSON["data"] as? [[String: Any]] {
+            for dict in dataArr {
+                guard let id = (dict["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !id.isEmpty else { continue }
+                let displayName = ((dict["display_name"] as? String) ?? id)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = (displayName.isEmpty || displayName.lowercased() == id.lowercased())
+                    ? id
+                    : "\(displayName) (\(id))"
+                let ctx = intValue(dict["context_length"])
+                let ctxText: String? = {
+                    if ctx >= 1_000_000 {
+                        return "\(max(1, Int(round(Double(ctx) / 1_048_576.0))))M ctx"
+                    }
+                    if ctx >= 1024 {
+                        return "\(ctx / 1024)K ctx"
+                    }
+                    return nil
+                }()
+                let quotaNote = [ctxText, "官方已授权"].compactMap { $0 }.joined(separator: " · ")
+                modelItems.append(ModelUsageItem(
+                    id: "kimi.model.\(id.lowercased())",
+                    modelName: title,
+                    origin: .officialCloud,
+                    matchKey: id.lowercased(),
+                    cloudQuotaText: quotaNote
+                ))
+            }
+        }
+
+        let surfaceSummary = surfaceParts.isEmpty ? nil : surfaceParts.joined(separator: " · ")
+        guard !modelItems.isEmpty || surfaceSummary != nil || periodReqs != nil else {
+            return nil
+        }
+
+        return CloudBillingSummary(
+            sourceName: sourceName,
+            periodLabel: periodReqs != nil ? "本周调用" : nil,
+            periodRequests: periodReqs,
+            surfaceSummary: surfaceSummary,
+            models: modelItems
+        )
+    }
+
+    /// 兼容标准 Moonshot Open Platform API Key (`sk-...`) 查询官方账户余额与可用模型
+    private func fetchMoonshotOpenPlatformQuota(
+        apiKey: String,
+        regionHint: String?
+    ) async -> ProviderQuotaResult? {
+        let lower = (regionHint ?? "").lowercased()
+        let hosts: [String] = {
+            if lower == "global" || lower.contains("moonshot.ai") {
+                return ["https://api.moonshot.ai/v1", "https://api.moonshot.cn/v1"]
+            }
+            return ["https://api.moonshot.cn/v1", "https://api.moonshot.ai/v1"]
+        }()
+
+        for base in hosts {
+            guard let balURL = URL(string: "\(base)/users/me/balance") else { continue }
+            var req = URLRequest(url: balURL)
+            req.httpMethod = "GET"
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            guard let (data, resp) = try? await session.data(for: req),
+                  let code = (resp as? HTTPURLResponse)?.statusCode,
+                  (200..<300).contains(code),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                continue
+            }
+            let balData = (json["data"] as? [String: Any]) ?? json
+            guard let avail = optionalDoubleValue(balData["available_balance"]) else { continue }
+            let voucher = optionalDoubleValue(balData["voucher_balance"]) ?? 0.0
+            let cash = optionalDoubleValue(balData["cash_balance"]) ?? 0.0
+            let sym = base.contains("moonshot.ai") ? "$" : "¥"
+            let walletText = String(format: "余额 %@%.2f", sym, avail)
+
+            var modelItems: [ModelUsageItem] = []
+            if let mURL = URL(string: "\(base)/models") {
+                var mReq = URLRequest(url: mURL)
+                mReq.httpMethod = "GET"
+                mReq.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                if let (mData, mResp) = try? await session.data(for: mReq),
+                   let mCode = (mResp as? HTTPURLResponse)?.statusCode,
+                   (200..<300).contains(mCode),
+                   let mJSON = try? JSONSerialization.jsonObject(with: mData) as? [String: Any],
+                   let mArr = mJSON["data"] as? [[String: Any]] {
+                    for dict in mArr.prefix(12) {
+                        guard let id = (dict["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                              !id.isEmpty else { continue }
+                        modelItems.append(ModelUsageItem(
+                            id: "moonshot.model.\(id.lowercased())",
+                            modelName: id,
+                            origin: .officialCloud,
+                            matchKey: id.lowercased(),
+                            cloudQuotaText: "按量可用"
+                        ))
+                    }
+                }
+            }
+
+            let detailNote = voucher > 0.005
+                ? String(format: "现金 %@%.2f · 代金券 %@%.2f", sym, cash, sym, voucher)
+                : String(format: "可用余额 %@%.2f", sym, avail)
+
+            return ProviderQuotaResult(
+                planBadge: base.contains("moonshot.ai") ? "Moonshot · Global" : "Moonshot · CN",
+                windows: [],
+                walletBalanceText: walletText,
+                cloudBilling: CloudBillingSummary(
+                    sourceName: "Moonshot 官方账单",
+                    surfaceSummary: detailNote,
+                    models: modelItems
+                ),
+                statusMessage: "已同步 Moonshot 开放平台官方账户余额"
+            )
+        }
+        return nil
     }
 
     // MARK: - 4. MiniMax Coding Plan / Token Plan
@@ -1921,11 +2814,20 @@ actor ProviderQuotaService {
 
                     cachedMiniMaxRegionHost[account.id] = host
                     let regionTag = host.contains("minimaxi.com") ? "CN" : "Global"
-                    let walletBalance = await fetchMiniMaxBalanceText(host: host, apiKey: rawKey)
+                    async let walletTask = fetchMiniMaxBalanceText(host: host, apiKey: rawKey)
+                    async let billingTask = fetchMiniMaxBillingData(host: host, apiKey: rawKey)
+                    let walletBalance = await walletTask
+                    let billingPayload = decodeMiniMaxBillingPayload(await billingTask)
 
                     let remainsList = (dataEnvelope?["model_remains"] as? [[String: Any]])
                         ?? (json["model_remains"] as? [[String: Any]])
                         ?? []
+
+                    let cloudBilling = buildMiniMaxCloudBilling(
+                        remainsList: remainsList,
+                        billingPayload: billingPayload,
+                        host: host
+                    )
 
                     let rawPlanTitle = ((dataEnvelope?["current_subscribe_title"] as? String)
                         ?? (json["current_subscribe_title"] as? String)
@@ -1940,7 +2842,8 @@ actor ProviderQuotaService {
                             planBadge: (rawPlanTitle?.isEmpty == false) ? "\(rawPlanTitle!) · \(regionTag)" : "MiniMax · \(regionTag)",
                             windows: [],
                             walletBalanceText: walletBalance,
-                            statusMessage: walletBalance != nil ? "当前无活跃 Token Plan · 已同步账户余额" : "暂无活跃 Token Plan 套餐记录"
+                            cloudBilling: cloudBilling,
+                            statusMessage: walletBalance != nil ? "当前无活跃 Token Plan · 已同步账户余额与官方账单" : "暂无活跃 Token Plan 套餐记录"
                         )
                     }
 
@@ -1953,73 +2856,41 @@ actor ProviderQuotaService {
                     var windows: [QuotaWindow] = []
 
                     // 5h 窗口（注意：status == 3 是服务端无此项权益的占位符，应跳过，而非显示“不限额”！）
-                    if !isMiniMaxPlaceholderLane(
+                    if let parsed5h = parseMiniMaxWindowLane(
                         selected,
                         percentField: "current_interval_remaining_percent",
                         totalField: "current_interval_total_count",
-                        statusField: "current_interval_status"
+                        usageField: "current_interval_usage_count",
+                        statusField: "current_interval_status",
+                        endField: "end_time",
+                        remainsField: "remains_time"
                     ) {
-                        let intervalReset = parseMiniMaxResetDate(
-                            endRaw: selected["end_time"],
-                            remainsRaw: selected["remains_time"]
-                        )
-                        let totalCount = intValue(selected["current_interval_total_count"])
-                        let remainingCount = intValue(selected["current_interval_usage_count"])
-                        if totalCount > 0 {
-                            let usedCount = max(0, totalCount - remainingCount)
-                            let pct = min(100.0, max(0.0, Double(usedCount) / Double(totalCount) * 100.0))
-                            windows.append(QuotaWindow(
-                                id: "minimax.5h",
-                                label: "5h 窗口",
-                                usedPercent: pct,
-                                detailText: "\(usedCount) / \(totalCount)",
-                                resetAt: intervalReset
-                            ))
-                        } else if let remPct = optionalDoubleValue(selected["current_interval_remaining_percent"]) {
-                            let clampedRem = min(100.0, max(0.0, remPct))
-                            windows.append(QuotaWindow(
-                                id: "minimax.5h",
-                                label: "5h 窗口",
-                                usedPercent: max(0.0, 100.0 - clampedRem),
-                                detailText: String(format: "剩余 %.0f%%", clampedRem),
-                                resetAt: intervalReset
-                            ))
-                        }
+                        windows.append(QuotaWindow(
+                            id: "minimax.5h",
+                            label: "5h 窗口",
+                            usedPercent: parsed5h.usedPercent,
+                            detailText: parsed5h.detailText,
+                            resetAt: parsed5h.resetAt
+                        ))
                     }
 
                     // 7d 周窗口（同样过滤 status == 3 占位符）
-                    if !isMiniMaxPlaceholderLane(
+                    if let parsed7d = parseMiniMaxWindowLane(
                         selected,
                         percentField: "current_weekly_remaining_percent",
                         totalField: "current_weekly_total_count",
-                        statusField: "current_weekly_status"
+                        usageField: "current_weekly_usage_count",
+                        statusField: "current_weekly_status",
+                        endField: "weekly_end_time",
+                        remainsField: "weekly_remains_time"
                     ) {
-                        let weeklyReset = parseMiniMaxResetDate(
-                            endRaw: selected["weekly_end_time"],
-                            remainsRaw: selected["weekly_remains_time"]
-                        )
-                        let wTotal = intValue(selected["current_weekly_total_count"])
-                        let wRemaining = intValue(selected["current_weekly_usage_count"])
-                        if wTotal > 0 {
-                            let wUsed = max(0, wTotal - wRemaining)
-                            let pct = min(100.0, max(0.0, Double(wUsed) / Double(wTotal) * 100.0))
-                            windows.append(QuotaWindow(
-                                id: "minimax.7d",
-                                label: "7d 周限额",
-                                usedPercent: pct,
-                                detailText: "\(wUsed) / \(wTotal)",
-                                resetAt: weeklyReset
-                            ))
-                        } else if let remPct = optionalDoubleValue(selected["current_weekly_remaining_percent"]) {
-                            let clampedRem = min(100.0, max(0.0, remPct))
-                            windows.append(QuotaWindow(
-                                id: "minimax.7d",
-                                label: "7d 周限额",
-                                usedPercent: max(0.0, 100.0 - clampedRem),
-                                detailText: String(format: "剩余 %.0f%%", clampedRem),
-                                resetAt: weeklyReset
-                            ))
-                        }
+                        windows.append(QuotaWindow(
+                            id: "minimax.7d",
+                            label: "7d 周限额",
+                            usedPercent: parsed7d.usedPercent,
+                            detailText: parsed7d.detailText,
+                            resetAt: parsed7d.resetAt
+                        ))
                     }
 
                     let badgeBase = (rawPlanTitle?.isEmpty == false)
@@ -2030,6 +2901,7 @@ actor ProviderQuotaService {
                         planBadge: "\(badgeBase) · \(regionTag)",
                         windows: windows,
                         walletBalanceText: walletBalance,
+                        cloudBilling: cloudBilling,
                         statusMessage: windows.isEmpty ? "当前套餐无活跃限流窗口" : nil
                     )
                 } catch {
@@ -2040,21 +2912,63 @@ actor ProviderQuotaService {
             }
         }
 
-        // 若套餐端点均未匹配，兜底尝试按量 API 余额接口
+        // 若套餐端点均未匹配，兜底尝试按量 API 余额与账单接口
         for host in orderedHosts {
-            if let walletBalance = await fetchMiniMaxBalanceText(host: host, apiKey: rawKey) {
+            async let walletTask = fetchMiniMaxBalanceText(host: host, apiKey: rawKey)
+            async let billingTask = fetchMiniMaxBillingData(host: host, apiKey: rawKey)
+            let walletBalance = await walletTask
+            let billingPayload = decodeMiniMaxBillingPayload(await billingTask)
+            if walletBalance != nil || billingPayload != nil {
                 cachedMiniMaxRegionHost[account.id] = host
                 let regionTag = host.contains("minimaxi.com") ? "CN" : "Global"
+                let cloudBilling = buildMiniMaxCloudBilling(
+                    remainsList: [],
+                    billingPayload: billingPayload,
+                    host: host
+                )
                 return ProviderQuotaResult(
                     planBadge: "API 按量 · \(regionTag)",
                     windows: [],
                     walletBalanceText: walletBalance,
-                    statusMessage: "已同步 MiniMax 按量账户可用余额"
+                    cloudBilling: cloudBilling,
+                    statusMessage: "已同步 MiniMax 按量账户余额与官方计费明细"
                 )
             }
         }
 
         return ProviderQuotaResult(errorMessage: "MiniMax 额度查询失败: \(lastError)")
+    }
+
+    private func parseMiniMaxWindowLane(
+        _ item: [String: Any],
+        percentField: String,
+        totalField: String,
+        usageField: String,
+        statusField: String,
+        endField: String,
+        remainsField: String
+    ) -> (usedPercent: Double, detailText: String, resetAt: Date?)? {
+        guard !isMiniMaxPlaceholderLane(
+            item,
+            percentField: percentField,
+            totalField: totalField,
+            statusField: statusField
+        ) else {
+            return nil
+        }
+        let reset = parseMiniMaxResetDate(endRaw: item[endField], remainsRaw: item[remainsField])
+        let totalCount = intValue(item[totalField])
+        let remainingCount = intValue(item[usageField])
+        if totalCount > 0 {
+            let usedCount = max(0, totalCount - remainingCount)
+            let pct = min(100.0, max(0.0, Double(usedCount) / Double(totalCount) * 100.0))
+            return (pct, "\(usedCount) / \(totalCount)", reset)
+        }
+        if let remPct = optionalDoubleValue(item[percentField]) {
+            let clampedRem = min(100.0, max(0.0, remPct))
+            return (max(0.0, 100.0 - clampedRem), String(format: "剩余 %.0f%%", clampedRem), reset)
+        }
+        return nil
     }
 
     private func isMiniMaxPlaceholderLane(
@@ -2101,6 +3015,289 @@ actor ProviderQuotaService {
         return String(format: "余额 %@%.2f", sym, amount)
     }
 
+    private func fetchMiniMaxBillingData(host: String, apiKey: String) async -> Data? {
+        guard let url = URL(string: "\(host)/account/amount?page=1&limit=50&aggregate=true") else {
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, resp) = try? await session.data(for: req),
+              let code = (resp as? HTTPURLResponse)?.statusCode,
+              (200..<300).contains(code) else {
+            return nil
+        }
+        return data
+    }
+
+    private func decodeMiniMaxBillingPayload(_ data: Data?) -> [String: Any]? {
+        guard let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let baseResp = (json["base_resp"] as? [String: Any]) ?? ((json["data"] as? [String: Any])?["base_resp"] as? [String: Any])
+        if let sc = baseResp?["status_code"], intValue(sc, default: 0) != 0 {
+            return nil
+        }
+        return (json["data"] as? [String: Any]) ?? json
+    }
+
+    private func buildMiniMaxCloudBilling(
+        remainsList: [[String: Any]],
+        billingPayload: [String: Any]?,
+        host: String
+    ) -> CloudBillingSummary? {
+        let sym = host.contains("minimaxi.com") ? "¥" : "$"
+        var itemsByOrder: [ModelUsageItem] = []
+        var indexByKey: [String: Int] = [:]
+        var activePoolSummaryParts: [String] = []
+
+        // 1. 解析套餐模型池（general / video / speech / image / music / MiniMax-M*）
+        for entry in remainsList {
+            let rawName = ((entry["model_name"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawName.isEmpty else { continue }
+
+            let lane5h = parseMiniMaxWindowLane(
+                entry,
+                percentField: "current_interval_remaining_percent",
+                totalField: "current_interval_total_count",
+                usageField: "current_interval_usage_count",
+                statusField: "current_interval_status",
+                endField: "end_time",
+                remainsField: "remains_time"
+            )
+            let lane7d = parseMiniMaxWindowLane(
+                entry,
+                percentField: "current_weekly_remaining_percent",
+                totalField: "current_weekly_total_count",
+                usageField: "current_weekly_usage_count",
+                statusField: "current_weekly_status",
+                endField: "weekly_end_time",
+                remainsField: "weekly_remains_time"
+            )
+            guard lane5h != nil || lane7d != nil else { continue }
+
+            let lower = rawName.lowercased()
+            let (displayName, matchKey): (String, String?) = {
+                switch lower {
+                case "general":
+                    return ("Text / Coding 通用模型池", nil)
+                case "video", "hailuo":
+                    return ("Hailuo Video 视频池", "video")
+                case "speech", "t2a", "voice":
+                    return ("Speech 语音池", "speech")
+                case "image", "image-01":
+                    return ("Image 图像池", "image")
+                case "music":
+                    return ("Music 音乐池", "music")
+                default:
+                    return (rawName, lower)
+                }
+            }()
+
+            var quotaParts: [String] = []
+            if let l5 = lane5h {
+                quotaParts.append("5h \(l5.detailText)")
+            }
+            if let l7 = lane7d {
+                quotaParts.append("7d \(l7.detailText)")
+            }
+            let maxUsed = max(lane5h?.usedPercent ?? 0, lane7d?.usedPercent ?? 0)
+            if maxUsed >= 0.5 {
+                let shortPool = lower == "general" ? "通用池" : displayName
+                activePoolSummaryParts.append("\(shortPool)已用 \(Int(round(maxUsed)))%")
+            }
+
+            let item = ModelUsageItem(
+                id: "minimax.pool.\(lower)",
+                modelName: displayName,
+                origin: .officialCloud,
+                matchKey: matchKey,
+                cloudUsedPercent: maxUsed,
+                cloudQuotaText: quotaParts.joined(separator: " · "),
+                cloudResetAt: lane5h?.resetAt ?? lane7d?.resetAt
+            )
+            indexByKey[lower] = itemsByOrder.count
+            itemsByOrder.append(item)
+        }
+
+        // 2. 解析 `/account/amount` 按模型计费流水
+        var todayTokens = 0
+        var todayRequests = 0
+        var todaySpend = 0.0
+        var monthTokens = 0
+        var monthRequests = 0
+        var monthSpend = 0.0
+        var allRecordTokens = 0
+        var allRecordRequests = 0
+        var allRecordSpend = 0.0
+
+        struct BilledModelAcc {
+            var modelName: String
+            var todayTokens: Int = 0
+            var monthTokens: Int = 0
+            var allTokens: Int = 0
+            var monthReqs: Int = 0
+            var allReqs: Int = 0
+            var monthSpend: Double = 0.0
+            var allSpend: Double = 0.0
+        }
+        var billedByModel: [String: BilledModelAcc] = [:]
+
+        let todayStr = localDateString()
+        let monthPrefix = String(todayStr.prefix(7))
+
+        if let billingPayload {
+            let records = (billingPayload["charge_records"] as? [[String: Any]]) ?? []
+            for rec in records {
+                let rawModel = ((rec["model"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let modelName = rawModel.isEmpty
+                    ? (((rec["method"] as? String) ?? "MiniMax API").trimmingCharacters(in: .whitespacesAndNewlines))
+                    : rawModel
+                let key = modelName.lowercased()
+
+                var tok = Int(optionalDoubleValue(rec["consume_token"]) ?? 0)
+                if tok == 0 {
+                    let inTok = Int(optionalDoubleValue(rec["consume_input_token"]) ?? 0)
+                    let outTok = Int(optionalDoubleValue(rec["consume_output_token"]) ?? 0)
+                    tok = inTok + outTok
+                }
+                let cash = optionalDoubleValue(rec["consume_cash"]) ?? 0.0
+
+                let recDate: String = {
+                    if let ct = (rec["consume_time"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       ct.count >= 10 {
+                        return String(ct.prefix(10))
+                    }
+                    if let ymd = (rec["ymd"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !ymd.isEmpty {
+                        if ymd.count == 8 && !ymd.contains("-") {
+                            return "\(ymd.prefix(4))-\(ymd.dropFirst(4).prefix(2))-\(ymd.suffix(2))"
+                        }
+                        return String(ymd.prefix(10))
+                    }
+                    if let ts = optionalDoubleValue(rec["created_at"]), ts > 0 {
+                        let d = Date(timeIntervalSince1970: ts > 1_000_000_000_000 ? ts / 1000.0 : ts)
+                        return localDateString(from: d)
+                    }
+                    return ""
+                }()
+
+                var acc = billedByModel[key] ?? BilledModelAcc(modelName: modelName)
+                acc.allTokens += tok
+                acc.allReqs += 1
+                acc.allSpend += cash
+                allRecordTokens += tok
+                allRecordRequests += 1
+                allRecordSpend += cash
+
+                if recDate == todayStr {
+                    todayTokens += tok
+                    todayRequests += 1
+                    todaySpend += cash
+                    acc.todayTokens += tok
+                }
+                if recDate.hasPrefix(monthPrefix) {
+                    monthTokens += tok
+                    monthRequests += 1
+                    monthSpend += cash
+                    acc.monthTokens += tok
+                    acc.monthReqs += 1
+                    acc.monthSpend += cash
+                }
+                billedByModel[key] = acc
+            }
+        }
+
+        let sumTokens = Int(optionalDoubleValue(billingPayload?["consume_token_sum"]) ?? 0)
+        let sumCash = optionalDoubleValue(billingPayload?["consume_cash_sum"]) ?? 0.0
+        let totalCnt = intValue(billingPayload?["total_cnt"], default: allRecordRequests)
+
+        let useCurrentMonth = (monthTokens > 0 || monthSpend > 0.0001)
+        let modelPeriodTag = useCurrentMonth ? "本月" : "账单"
+
+        let sortedBilled = billedByModel.sorted { lhs, rhs in
+            let lTok = useCurrentMonth ? lhs.value.monthTokens : lhs.value.allTokens
+            let rTok = useCurrentMonth ? rhs.value.monthTokens : rhs.value.allTokens
+            if lTok != rTok { return lTok > rTok }
+            return lhs.value.allSpend > rhs.value.allSpend
+        }
+
+        for (key, acc) in sortedBilled {
+            let pTok = useCurrentMonth ? (acc.monthTokens > 0 ? acc.monthTokens : acc.allTokens) : acc.allTokens
+            let pTag = (useCurrentMonth && acc.monthTokens == 0 && acc.allTokens > 0) ? "历史" : modelPeriodTag
+            let pReqs = (useCurrentMonth && acc.monthReqs > 0) ? acc.monthReqs : acc.allReqs
+            let pSpend = (useCurrentMonth && acc.monthSpend > 0.0001) ? acc.monthSpend : acc.allSpend
+            let spendText = pSpend > 0.0001 ? formatMoneyText(pSpend, symbol: sym) : nil
+
+            if let idx = indexByKey[key] {
+                itemsByOrder[idx].cloudTodayTokens = acc.todayTokens > 0 ? acc.todayTokens : nil
+                itemsByOrder[idx].cloudPeriodTokens = pTok > 0 ? pTok : nil
+                itemsByOrder[idx].cloudPeriodLabel = pTok > 0 ? pTag : nil
+                itemsByOrder[idx].cloudRequests = pReqs > 0 ? pReqs : nil
+                itemsByOrder[idx].cloudSpendText = spendText
+            } else {
+                itemsByOrder.append(ModelUsageItem(
+                    id: "minimax.bill.\(key)",
+                    modelName: acc.modelName,
+                    origin: .officialCloud,
+                    matchKey: key,
+                    cloudTodayTokens: acc.todayTokens > 0 ? acc.todayTokens : nil,
+                    cloudPeriodTokens: pTok > 0 ? pTok : nil,
+                    cloudPeriodLabel: pTok > 0 ? pTag : nil,
+                    cloudRequests: pReqs > 0 ? pReqs : nil,
+                    cloudSpendText: spendText
+                ))
+            }
+        }
+
+        let periodLabel: String?
+        let periodTokens: Int?
+        let periodRequests: Int?
+        let periodSpendText: String?
+
+        if useCurrentMonth {
+            periodLabel = "本月账单"
+            periodTokens = monthTokens > 0 ? monthTokens : nil
+            periodRequests = monthRequests > 0 ? monthRequests : nil
+            periodSpendText = monthSpend > 0.0001 ? formatMoneyText(monthSpend, symbol: sym) : nil
+        } else if max(sumTokens, allRecordTokens) > 0 || max(sumCash, allRecordSpend) > 0.0001 {
+            periodLabel = "官方账单"
+            let totTok = max(sumTokens, allRecordTokens)
+            let totCash = max(sumCash, allRecordSpend)
+            periodTokens = totTok > 0 ? totTok : nil
+            periodRequests = totalCnt > 0 ? totalCnt : nil
+            periodSpendText = totCash > 0.0001 ? formatMoneyText(totCash, symbol: sym) : nil
+        } else {
+            periodLabel = nil
+            periodTokens = nil
+            periodRequests = nil
+            periodSpendText = nil
+        }
+
+        let surfaceSummary = activePoolSummaryParts.isEmpty
+            ? nil
+            : activePoolSummaryParts.prefix(2).joined(separator: " · ")
+
+        guard !itemsByOrder.isEmpty || periodTokens != nil || periodSpendText != nil || surfaceSummary != nil else {
+            return nil
+        }
+
+        return CloudBillingSummary(
+            sourceName: "MiniMax 官方计费",
+            todayTokens: todayTokens > 0 ? todayTokens : nil,
+            todayRequests: todayRequests > 0 ? todayRequests : nil,
+            todaySpendText: todaySpend > 0.0001 ? formatMoneyText(todaySpend, symbol: sym) : nil,
+            periodLabel: periodLabel,
+            periodTokens: periodTokens,
+            periodRequests: periodRequests,
+            periodSpendText: periodSpendText,
+            surfaceSummary: surfaceSummary,
+            models: itemsByOrder
+        )
+    }
+
     // MARK: - 5. Google Antigravity
 
     private static let antigravityModelBlacklist: Set<String> = [
@@ -2121,6 +3318,7 @@ actor ProviderQuotaService {
         let tierName: String?
         let windows: [QuotaWindow]
         let hasGroupedSummary: Bool
+        let cloudBilling: CloudBillingSummary?
     }
 
     private func fetchAntigravityQuota(
@@ -2139,7 +3337,8 @@ actor ProviderQuotaService {
                 resolvedLabel: matchedLive.email ?? matchedLive.displayName,
                 resolvedExternalId: matchedLive.email,
                 planBadge: matchedLive.tierName ?? "Antigravity",
-                windows: matchedLive.windows
+                windows: matchedLive.windows,
+                cloudBilling: matchedLive.cloudBilling
             )
         }
 
@@ -2149,7 +3348,8 @@ actor ProviderQuotaService {
                     resolvedLabel: first.email ?? first.displayName,
                     resolvedExternalId: first.email,
                     planBadge: first.tierName ?? "Antigravity",
-                    windows: first.windows
+                    windows: first.windows,
+                    cloudBilling: first.cloudBilling
                 )
             }
             return ProviderQuotaResult(statusMessage: "Antigravity 未在后台运行 · 已启用本地日志统计")
@@ -2177,7 +3377,8 @@ actor ProviderQuotaService {
                             resolvedLabel: result.resolvedLabel ?? matchedLive.email,
                             resolvedExternalId: result.resolvedExternalId ?? matchedLive.email,
                             planBadge: result.planBadge ?? matchedLive.tierName,
-                            windows: merged
+                            windows: merged,
+                            cloudBilling: result.cloudBilling ?? matchedLive.cloudBilling
                         )
                     }
                     return result
@@ -2189,7 +3390,8 @@ actor ProviderQuotaService {
                     resolvedLabel: fallbackLive.email ?? fallbackLive.displayName,
                     resolvedExternalId: fallbackLive.email,
                     planBadge: fallbackLive.tierName ?? "Antigravity",
-                    windows: fallbackLive.windows
+                    windows: fallbackLive.windows,
+                    cloudBilling: fallbackLive.cloudBilling
                 )
             }
             return ProviderQuotaResult(errorMessage: "无法从 Cloud Code 获取 Antigravity 模型配额")
@@ -2199,7 +3401,8 @@ actor ProviderQuotaService {
                     resolvedLabel: fallbackLive.email ?? fallbackLive.displayName,
                     resolvedExternalId: fallbackLive.email,
                     planBadge: fallbackLive.tierName ?? "Antigravity",
-                    windows: fallbackLive.windows
+                    windows: fallbackLive.windows,
+                    cloudBilling: fallbackLive.cloudBilling
                 )
             }
             return ProviderQuotaResult(errorMessage: error.localizedDescription)
@@ -2266,32 +3469,99 @@ actor ProviderQuotaService {
         let bodyDict: [String: Any] = (projectId?.isEmpty == false) ? ["project": projectId!] : [:]
         let projectBodyData = try JSONSerialization.data(withJSONObject: bodyDict)
 
-        // Step 2: 优先调用新版 `/v1internal:retrieveUserQuotaSummary`（原生 5h + 7d 分组双窗口！）
-        if let summaryURL = URL(string: "\(baseURL)/v1internal:retrieveUserQuotaSummary") {
-            var sumReq = URLRequest(url: summaryURL)
-            sumReq.httpMethod = "POST"
-            sumReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            sumReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            sumReq.setValue(hubUA, forHTTPHeaderField: "User-Agent")
-            sumReq.httpBody = projectBodyData
+        // Step 2: 并发请求 `/v1internal:retrieveUserQuotaSummary`（分组 5h+7d 窗口）与 `fetchAvailableModels`（单模型实时配额明细）
+        async let summaryWindowsTask = fetchCloudCodeSummaryWindows(
+            baseURL: baseURL,
+            accessToken: accessToken,
+            projectBodyData: projectBodyData,
+            hubUA: hubUA
+        )
+        async let modelItemsResultTask = fetchCloudCodeModelItemsResult(
+            baseURL: baseURL,
+            accessToken: accessToken,
+            projectBodyData: projectBodyData,
+            hubUA: hubUA
+        )
 
-            if let (sumData, sumResp) = try? await session.data(for: sumReq),
-               let sumStatus = (sumResp as? HTTPURLResponse)?.statusCode,
-               (200..<300).contains(sumStatus),
-               let sumJSON = try? JSONSerialization.jsonObject(with: sumData) as? [String: Any] {
-                let summaryWindows = parseAntigravityQuotaSummary(sumJSON)
-                if !summaryWindows.isEmpty {
-                    return ProviderQuotaResult(
-                        resolvedLabel: email,
-                        resolvedExternalId: email,
-                        planBadge: tierBadge ?? "Antigravity",
-                        windows: summaryWindows
-                    )
-                }
-            }
+        let summaryWindows = await summaryWindowsTask
+        let modelItemsResult = await modelItemsResultTask
+        let optionalModelItems = try? modelItemsResult.get()
+        let cloudBilling = buildAntigravityCloudBilling(
+            items: optionalModelItems ?? [],
+            sourceName: "Cloud Code 官方配额"
+        )
+
+        if !summaryWindows.isEmpty {
+            return ProviderQuotaResult(
+                resolvedLabel: email,
+                resolvedExternalId: email,
+                planBadge: tierBadge ?? "Antigravity",
+                windows: summaryWindows,
+                cloudBilling: cloudBilling
+            )
         }
 
-        // Step 3: 回退旧版 `fetchAvailableModels`（若全部返回 100% 剩余，再以 `retrieveUserQuota` 交叉校验）
+        let rawItems = try modelItemsResult.get()
+        let windows = groupAntigravityModelPools(rawItems)
+        return ProviderQuotaResult(
+            resolvedLabel: email,
+            resolvedExternalId: email,
+            planBadge: tierBadge ?? "Antigravity",
+            windows: windows,
+            cloudBilling: cloudBilling,
+            statusMessage: windows.isEmpty ? "已连接 Antigravity（当前无受限模型池）" : nil
+        )
+    }
+
+    private func fetchCloudCodeSummaryWindows(
+        baseURL: String,
+        accessToken: String,
+        projectBodyData: Data,
+        hubUA: String
+    ) async -> [QuotaWindow] {
+        guard let summaryURL = URL(string: "\(baseURL)/v1internal:retrieveUserQuotaSummary") else {
+            return []
+        }
+        var sumReq = URLRequest(url: summaryURL)
+        sumReq.httpMethod = "POST"
+        sumReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        sumReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        sumReq.setValue(hubUA, forHTTPHeaderField: "User-Agent")
+        sumReq.httpBody = projectBodyData
+        guard let (sumData, sumResp) = try? await session.data(for: sumReq),
+              let sumStatus = (sumResp as? HTTPURLResponse)?.statusCode,
+              (200..<300).contains(sumStatus),
+              let sumJSON = try? JSONSerialization.jsonObject(with: sumData) as? [String: Any] else {
+            return []
+        }
+        return parseAntigravityQuotaSummary(sumJSON)
+    }
+
+    private func fetchCloudCodeModelItemsResult(
+        baseURL: String,
+        accessToken: String,
+        projectBodyData: Data,
+        hubUA: String
+    ) async -> Result<[(label: String, modelId: String, usedPercent: Double, resetAt: Date?)], Error> {
+        do {
+            let items = try await fetchCloudCodeModelItems(
+                baseURL: baseURL,
+                accessToken: accessToken,
+                projectBodyData: projectBodyData,
+                hubUA: hubUA
+            )
+            return .success(items)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    private func fetchCloudCodeModelItems(
+        baseURL: String,
+        accessToken: String,
+        projectBodyData: Data,
+        hubUA: String
+    ) async throws -> [(label: String, modelId: String, usedPercent: Double, resetAt: Date?)] {
         var modelsReq = URLRequest(url: URL(string: "\(baseURL)/v1internal:fetchAvailableModels")!)
         modelsReq.httpMethod = "POST"
         modelsReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -2371,14 +3641,68 @@ actor ProviderQuotaService {
                 }
             }
         }
+        return rawItems
+    }
 
-        let windows = groupAntigravityModelPools(rawItems)
-        return ProviderQuotaResult(
-            resolvedLabel: email,
-            resolvedExternalId: email,
-            planBadge: tierBadge ?? "Antigravity",
-            windows: windows,
-            statusMessage: windows.isEmpty ? "已连接 Antigravity（当前无受限模型池）" : nil
+    private func buildAntigravityCloudBilling(
+        items: [(label: String, modelId: String, usedPercent: Double, resetAt: Date?)],
+        sourceName: String
+    ) -> CloudBillingSummary? {
+        guard !items.isEmpty else { return nil }
+
+        var byLabel: [String: (label: String, modelId: String, usedPct: Double, resetAt: Date?)] = [:]
+        for item in items {
+            let key = item.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !key.isEmpty else { continue }
+            if let prev = byLabel[key] {
+                let mergedUsed = max(prev.usedPct, item.usedPercent)
+                let mergedReset: Date? = {
+                    switch (prev.resetAt, item.resetAt) {
+                    case let (a?, b?): return min(a, b)
+                    case let (a?, nil): return a
+                    case let (nil, b?): return b
+                    case (nil, nil): return nil
+                    }
+                }()
+                byLabel[key] = (prev.label, prev.modelId, mergedUsed, mergedReset)
+            } else {
+                byLabel[key] = (item.label, item.modelId, item.usedPercent, item.resetAt)
+            }
+        }
+
+        let sorted = byLabel.values.sorted { lhs, rhs in
+            let lUsed = lhs.usedPct > 0.1
+            let rUsed = rhs.usedPct > 0.1
+            if lUsed != rUsed { return lUsed && !rUsed }
+            if abs(lhs.usedPct - rhs.usedPct) > 0.1 { return lhs.usedPct > rhs.usedPct }
+            let lGemini = lhs.label.lowercased().contains("gemini")
+            let rGemini = rhs.label.lowercased().contains("gemini")
+            if lGemini != rGemini { return lGemini && !rGemini }
+            return lhs.label < rhs.label
+        }
+
+        let modelUsages: [ModelUsageItem] = sorted.map { entry in
+            let remPct = max(0.0, 100.0 - entry.usedPct)
+            return ModelUsageItem(
+                id: "agy.model.\(entry.modelId.lowercased())",
+                modelName: entry.label,
+                origin: .officialCloud,
+                matchKey: entry.label.lowercased(),
+                cloudUsedPercent: entry.usedPct,
+                cloudQuotaText: String(format: "云端剩余 %.0f%%", remPct),
+                cloudResetAt: entry.resetAt
+            )
+        }
+
+        let usedModelsCount = sorted.filter { $0.usedPct > 0.4 }.count
+        let surfaceSummary = usedModelsCount > 0
+            ? "多端实时配额 · \(usedModelsCount)/\(modelUsages.count) 个模型有消耗"
+            : nil
+
+        return CloudBillingSummary(
+            sourceName: sourceName,
+            surfaceSummary: surfaceSummary,
+            models: modelUsages
         )
     }
 
@@ -2501,7 +3825,7 @@ actor ProviderQuotaService {
                         groupedWindows = parseAntigravityQuotaSummary(summaryJSON)
                     }
 
-                    // 2. 调用 `GetUserStatus` 获取账号身份与旧版模型池回退数据
+                    // 2. 调用 `GetUserStatus` 获取账号身份与单模型实时配额明细
                     let statusJSON = await callLocalAntigravityRPC(
                         scheme: scheme,
                         port: port,
@@ -2557,12 +3881,18 @@ actor ProviderQuotaService {
                         : groupAntigravityModelPools(legacyItems)
                     guard !finalWindows.isEmpty else { continue }
 
+                    let cloudBilling = buildAntigravityCloudBilling(
+                        items: legacyItems,
+                        sourceName: "Antigravity 官方配额"
+                    )
+
                     statuses.append(LiveAntigravityStatus(
                         email: email,
                         displayName: name,
                         tierName: tier,
                         windows: finalWindows,
-                        hasGroupedSummary: !groupedWindows.isEmpty
+                        hasGroupedSummary: !groupedWindows.isEmpty,
+                        cloudBilling: cloudBilling
                     ))
                     foundForTarget = true
                     break
@@ -3032,6 +4362,40 @@ actor ProviderQuotaService {
     private func formEncode(_ value: String) -> String {
         let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         return value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
+    }
+
+    private func localDateString(from date: Date = Date()) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        let comps = cal.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", comps.year ?? 1970, comps.month ?? 1, comps.day ?? 1)
+    }
+
+    private func utcDateString(from date: Date = Date()) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        let comps = cal.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", comps.year ?? 1970, comps.month ?? 1, comps.day ?? 1)
+    }
+
+    private func formatMoneyText(_ amount: Double, symbol: String) -> String {
+        if amount >= 100 {
+            return String(format: "%@%.1f", symbol, amount)
+        }
+        if amount >= 0.01 {
+            return String(format: "%@%.2f", symbol, amount)
+        }
+        return String(format: "%@%.4f", symbol, amount)
+    }
+
+    private func formatCreditUnits(_ credits: Double) -> String {
+        if credits >= 100 {
+            return String(format: "%.0f cr", credits)
+        }
+        if credits >= 10 {
+            return String(format: "%.1f cr", credits)
+        }
+        return String(format: "%.2f cr", credits)
     }
 }
 
