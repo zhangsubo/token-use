@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 // MARK: - ProviderQuotaResult
 
@@ -93,6 +94,35 @@ actor ProviderQuotaService {
             }
         }
         return results
+    }
+
+    /// 仅探测本机 `127.0.0.1` 运行中的 Antigravity Language Server 更新配额（零公网请求，供会话轮次结束后即时刷新）
+    func refreshLocalAntigravityQuotas(
+        accounts: [ProviderAccountConfig],
+        existing: [String: ProviderQuotaResult]
+    ) async -> [String: ProviderQuotaResult] {
+        let agyAccounts = accounts.filter { $0.isEnabled && $0.provider == .antigravity }
+        guard !agyAccounts.isEmpty else { return existing }
+        let liveStatuses = await probeRunningAntigravityServers()
+        guard !liveStatuses.isEmpty else { return existing }
+
+        var updated = existing
+        for account in agyAccounts {
+            let acctEmail = (account.externalAccountId ?? existing[account.id]?.resolvedExternalId)?.lowercased()
+            let matched = acctEmail.flatMap { email in
+                liveStatuses.first(where: { $0.email?.lowercased() == email })
+            } ?? (account.authKind == .localOnly ? liveStatuses.first : nil)
+
+            if let matched, !matched.windows.isEmpty {
+                updated[account.id] = ProviderQuotaResult(
+                    resolvedLabel: matched.email ?? matched.displayName ?? existing[account.id]?.resolvedLabel,
+                    resolvedExternalId: matched.email ?? existing[account.id]?.resolvedExternalId,
+                    planBadge: matched.tierName ?? existing[account.id]?.planBadge ?? "Antigravity",
+                    windows: matched.windows
+                )
+            }
+        }
+        return updated
     }
 
     private func fetchQuota(
@@ -2967,10 +2997,18 @@ actor ProviderQuotaService {
     }
 
     private func optionalDoubleValue(_ any: Any?) -> Double? {
-        guard let any, !(any is NSNull), !(any is Bool) else { return nil }
+        guard let any, !(any is NSNull) else { return nil }
+        // 注意：Foundation 中 NSNumber(0) / NSNumber(1) 执行 `any is Bool` 会返回 true！
+        // 必须用 CFBooleanGetTypeID() 仅排除真正的 JSON true/false，防止满额 `1` 被丢弃为 nil。
+        if CFGetTypeID(any as AnyObject) == CFBooleanGetTypeID() {
+            return nil
+        }
         if let v = any as? Double, v.isFinite { return v }
         if let v = any as? Int { return Double(v) }
-        if let v = any as? NSNumber { return v.doubleValue }
+        if let v = any as? NSNumber {
+            let d = v.doubleValue
+            return d.isFinite ? d : nil
+        }
         if let s = any as? String {
             let cleaned = s.trimmingCharacters(in: .whitespacesAndNewlines)
                 .replacingOccurrences(of: ",", with: "")

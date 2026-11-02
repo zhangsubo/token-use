@@ -27,6 +27,7 @@ final class AppState: ObservableObject {
     private var timer: Timer?
     private var hasStarted = false
     private var isRefreshingLocalOnly = false
+    private var lastFullSyncAt: Date = .distantPast
     private var lastQuotaResults: [String: ProviderQuotaResult] = [:]
     private let dashboardCacheFilename = "dashboard-v3.json"
 
@@ -73,9 +74,24 @@ final class AppState: ObservableObject {
         await performSync(showBlockingSpinner: dashboard == nil)
     }
 
-    /// 当本地会话刚结束一轮生成时触发：仅增量刷新本地日志 Token 与 tok/s，复用最近一次在线配额结果，避免频繁请求远端接口
+    /// 当本地会话刚结束一轮生成时触发：增量刷新本地日志 Token 与 tok/s，并同步零公网开销的本机 Antigravity RPC 配额；若发现已有配额窗口跨过 resetAt 则自动触发全量刷新
     func refreshLocalUsageOnly() async {
         guard !isLoading, !isRefreshingLocalOnly, !lastQuotaResults.isEmpty else { return }
+
+        let checkNow = Date()
+        let hasExpiredWindow = lastQuotaResults.values.contains { res in
+            res.windows.contains { win in
+                if let resetAt = win.resetAt {
+                    return resetAt <= checkNow
+                }
+                return false
+            }
+        }
+        if hasExpiredWindow && checkNow.timeIntervalSince(lastFullSyncAt) >= 45.0 {
+            await performSync(showBlockingSpinner: false)
+            return
+        }
+
         isRefreshingLocalOnly = true
         defer { isRefreshingLocalOnly = false }
 
@@ -96,6 +112,10 @@ final class AppState: ObservableObject {
         self.activeCodexAccountIds = bundle.activeCodexAccountIds
         let enabledAccounts = bundle.enabledAccounts
 
+        let updatedQuotas = await quotaService.refreshLocalAntigravityQuotas(
+            accounts: enabledAccounts,
+            existing: lastQuotaResults
+        )
         let dynamicModels = await quotaService.modelMapForAntigravity()
         let localUsage = await nativeUsageService.fetchCombined(
             accounts: enabledAccounts,
@@ -103,12 +123,13 @@ final class AppState: ObservableObject {
         )
 
         guard !isLoading else { return }
+        self.lastQuotaResults = updatedQuotas
         let now = Date()
         let builtDashboard = buildDashboard(
             enabledAccounts: enabledAccounts,
             activeCodexAccountIds: bundle.activeCodexAccountIds,
             localUsage: localUsage,
-            quotaResults: lastQuotaResults,
+            quotaResults: updatedQuotas,
             updatedAt: now
         )
         self.dashboard = builtDashboard
@@ -199,6 +220,7 @@ final class AppState: ObservableObject {
         self.lastQuotaResults = quotaResults
 
         let now = Date()
+        self.lastFullSyncAt = now
         let builtDashboard = buildDashboard(
             enabledAccounts: enabledAccounts,
             activeCodexAccountIds: bundle.activeCodexAccountIds,

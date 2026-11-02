@@ -273,6 +273,12 @@ struct QuotaWindow: Codable, Sendable, Identifiable, Equatable {
     var remainingPercent: Double {
         max(0, 100 - usedPercent)
     }
+
+    func effectiveRemainingPercent(at now: Date = Date()) -> Double {
+        if isUnlimited { return 100.0 }
+        if let resetAt, resetAt <= now { return 100.0 }
+        return remainingPercent
+    }
 }
 
 struct TokenBreakdownSnapshot: Codable, Sendable, Equatable {
@@ -347,6 +353,7 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
 
     /// 用于右侧边缘停靠条 (Edge Dock) 展示该平台当前剩余配额环形图百分比（0...100）
     var representativeRemainingPercent: Double? {
+        let now = Date()
         let activeCandidates: [AccountUsageSnapshot]
         if provider == .antigravity {
             activeCandidates = accounts.filter {
@@ -375,11 +382,11 @@ struct ProviderGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
                 return idLower.contains("gemini") || labelLower.contains("gemini") || idLower.contains("argon")
             }
             if !geminiWindows.isEmpty {
-                return geminiWindows.map(\.remainingPercent).min()
+                return geminiWindows.map { $0.effectiveRemainingPercent(at: now) }.min()
             }
         }
 
-        return finiteWindows.map(\.remainingPercent).min()
+        return finiteWindows.map { $0.effectiveRemainingPercent(at: now) }.min()
     }
 }
 
