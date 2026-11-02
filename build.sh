@@ -3,7 +3,7 @@
 # TokenUse.app 打包脚本
 #
 # 输入 env:
-#   MARKETING_VERSION  默认 1.3.0    （CFBundleShortVersionString，对应 git tag v*.*.*）
+#   MARKETING_VERSION  默认 1.3.1    （CFBundleShortVersionString，对应 git tag v*.*.*）
 #   BUILD_NUMBER       默认 1        （CFBundleVersion，对应 GitHub Actions run_number）
 #
 # 产物：
@@ -18,7 +18,7 @@ RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 ZIP_NAME="${APP_NAME}.zip"
 PROJECT_DIR="$(pwd -P)"
 
-MARKETING_VERSION="${MARKETING_VERSION:-1.3.0}"
+MARKETING_VERSION="${MARKETING_VERSION:-1.3.1}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache-physical"

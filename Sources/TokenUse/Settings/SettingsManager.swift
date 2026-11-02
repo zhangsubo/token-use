@@ -17,6 +17,7 @@ final class SettingsManager: ObservableObject {
         static let skippedVersion = "skippedVersion"
         static let enableAutoDiscovery = "enableAutoDiscovery"
         static let showEstimatedCost = "showEstimatedCost"
+        static let maskAccountLabels = "maskAccountLabels"
         static let providerOrder = "providerOrder"
         static let dockEdge = "dockEdge"
         static let dockVerticalRatio = "dockVerticalRatio"
@@ -58,6 +59,11 @@ final class SettingsManager: ObservableObject {
 
     @Published var showEstimatedCost: Bool {
         didSet { defaults.set(showEstimatedCost, forKey: Keys.showEstimatedCost) }
+    }
+
+    /// 是否对界面展示的账号名称/邮箱进行脱敏打码（默认 `true` 开启）
+    @Published var maskAccountLabels: Bool {
+        didSet { defaults.set(maskAccountLabels, forKey: Keys.maskAccountLabels) }
     }
 
     @Published var providerOrder: [TrackedProvider] {
@@ -133,6 +139,12 @@ final class SettingsManager: ObservableObject {
             self.showEstimatedCost = defaults.bool(forKey: Keys.showEstimatedCost)
         }
 
+        if defaults.object(forKey: Keys.maskAccountLabels) == nil {
+            self.maskAccountLabels = true
+        } else {
+            self.maskAccountLabels = defaults.bool(forKey: Keys.maskAccountLabels)
+        }
+
         self.providerOrder = Self.normalizedProviderOrder(from: defaults.stringArray(forKey: Keys.providerOrder))
 
         if let rawEdge = defaults.string(forKey: Keys.dockEdge),
@@ -159,6 +171,116 @@ final class SettingsManager: ObservableObject {
         self.skippedVersion = defaults.string(forKey: Keys.skippedVersion)
 
         loadAccountStore()
+    }
+
+    // MARK: - Account Label Masking
+
+    func displayAccountLabel(_ raw: String) -> String {
+        maskAccountLabels ? Self.maskAccountLabel(raw) : raw
+    }
+
+    /// 账号展示脱敏规则：
+    /// - 邮箱 / 长 ASCII 标识（如 `ad723837453@gmail.com`）→ `ad*******om`（保留首 2 位 + 最多 7 个 `*` + 末 2 位）
+    /// - 中文 / 含汉字自定义名称（如 `公司账号`）→ `公**号`（保留首 1 字 + 最多 7 个 `*` + 末 1 字）
+    /// - 复合标签（如 `公司账号 (user@domain.com)`、`MiMo (123...789)`）分段智能脱敏，保留通用平台/来源前缀
+    nonisolated static func maskAccountLabel(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return raw }
+
+        if genericWholeAccountLabels.contains(trimmed) {
+            return trimmed
+        }
+
+        // 处理形如 "Outer (Inner)" 的复合账号标签
+        if trimmed.hasSuffix(")"),
+           let openRange = trimmed.range(of: " (", options: .backwards) {
+            let outer = String(trimmed[..<openRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let inner = String(trimmed[openRange.upperBound..<trimmed.index(before: trimmed.endIndex)])
+                .trimmingCharacters(in: .whitespaces)
+            if !outer.isEmpty && !inner.isEmpty {
+                let maskedOuter = genericOuterAccountPrefixes.contains(outer) ? outer : maskSingleToken(outer)
+                let maskedInner = isGenericInnerAccountTag(inner) ? inner : maskSingleToken(inner)
+                return "\(maskedOuter) (\(maskedInner))"
+            }
+        }
+
+        // 处理中文全角括号形如 "公司账号（主力）"
+        if trimmed.hasSuffix("）"),
+           let openRange = trimmed.range(of: "（", options: .backwards) {
+            let outer = String(trimmed[..<openRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let inner = String(trimmed[openRange.upperBound..<trimmed.index(before: trimmed.endIndex)])
+                .trimmingCharacters(in: .whitespaces)
+            if !outer.isEmpty && !inner.isEmpty {
+                let maskedOuter = genericOuterAccountPrefixes.contains(outer) ? outer : maskSingleToken(outer)
+                let maskedInner = isGenericInnerAccountTag(inner) ? inner : maskSingleToken(inner)
+                return "\(maskedOuter)（\(maskedInner)）"
+            }
+        }
+
+        return maskSingleToken(trimmed)
+    }
+
+    private nonisolated static let genericWholeAccountLabels: Set<String> = [
+        "Codex", "Codex 账号", "Codex 本机默认", "Codex 托管账号", "OpenAI Codex", "OpenAI Codex 账号",
+        "Xiaomi MiMo", "Xiaomi MiMo 账号", "MiMo", "MiMo 账号", "MiMo Code", "MiMo Code 本机日志",
+        "Kimi", "Kimi 账号", "Kimi Code", "Kimi Code 账号", "Kimi API", "Kimi Web",
+        "MiniMax", "MiniMax 账号", "MiniMax Code", "MiniMax Code 本机日志",
+        "Antigravity", "Antigravity 账号", "Antigravity IDE", "Antigravity CLI", "Antigravity 本机服务",
+    ]
+
+    private nonisolated static let genericOuterAccountPrefixes: Set<String> = [
+        "Codex", "Codex 暂存", "OpenAI Codex",
+        "MiMo", "MiMo Code", "Xiaomi MiMo",
+        "Kimi", "Kimi Code", "Kimi API", "Kimi Web",
+        "MiniMax", "MiniMax Code",
+        "Antigravity",
+    ]
+
+    private nonisolated static let genericInnerAccountTags: Set<String> = [
+        "API Key", "ENV", "MIMO_COOKIE", "Claude Code", "OpenCode", "Kimi Desktop",
+        "Local RPC", "Antigravity Tools", "CLIProxyAPI",
+        "claude", "codex", "opencode", "gemini", "mimocode", "mimocode.json",
+        "minimax-cn-coding-plan", "minimax-coding-plan", "minimax", "xiaomi", "mimo", "kimi-code", "kimi-for-coding",
+    ]
+
+    private nonisolated static func isGenericInnerAccountTag(_ inner: String) -> Bool {
+        if genericInnerAccountTags.contains(inner) {
+            return true
+        }
+        if !inner.contains("@") && (inner.hasPrefix("~/.") || inner.hasPrefix("$")) {
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func maskSingleToken(_ token: String) -> String {
+        let chars = Array(token)
+        let count = chars.count
+        switch count {
+        case 0:
+            return ""
+        case 1:
+            return "*"
+        case 2:
+            return "\(chars[0])*"
+        default:
+            let hasCJK = token.unicodeScalars.contains { scalar in
+                let v = scalar.value
+                return (v >= 0x4E00 && v <= 0x9FFF)
+                    || (v >= 0x3400 && v <= 0x4DBF)
+                    || (v >= 0xF900 && v <= 0xFAFF)
+                    || (v >= 0x20000 && v <= 0x2FA1F)
+            }
+            if hasCJK || count <= 5 {
+                let starCount = min(max(count - 2, 1), 7)
+                return "\(chars[0])\(String(repeating: "*", count: starCount))\(chars[count - 1])"
+            } else {
+                let starCount = min(max(count - 4, 2), 7)
+                let prefix = String(chars[0...1])
+                let suffix = String(chars[(count - 2)...(count - 1)])
+                return "\(prefix)\(String(repeating: "*", count: starCount))\(suffix)"
+            }
+        }
     }
 
     // MARK: - Sidebar Position

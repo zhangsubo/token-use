@@ -24,7 +24,8 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 - **实测 `tok/s` 生成速率统计 & 2 列电池式配额卡片**：
   - 按各平台本地会话精确时间戳计算 `(输出 + 思考 Token) / 实测生成耗时`（自动剔除工具等待耗时），在平台标题栏、多账号卡片与展开明细中展示 **`⚡ tok/s` 平均速率与最近一轮速率**
   - 各账号采用 **2 列紧凑电池式 `剩余 xx%` 进度条**，支持一键展开输入 / 缓存命中率 / 输出 / 推理 Token 明细
-- **个性化排序与等效价值开关**：
+- **隐私脱敏、个性化排序与等效价值开关**：
+  - **账号名称默认脱敏展示**：默认开启展示层隐私打码（如邮箱脱敏为 `ad*******om`、中文备注脱敏为 `公**号`，复合标签自动分段处理且不影响编辑原始名称），支持在设置中随时一键开关
   - **平台展示顺序自由拖拽**：在设置中按平台拖拽调整展示顺序，主面板、顶部筛选栏、边缘停靠条与多账号管理页全局实时同步
   - **等效 API 折算价值（`≈ $x,xxx.xx`）**：基于 LiteLLM 分级定价折算等效 API 价值并附悬停说明，支持在设置中一键隐藏估算金额
 - **零侵入单遍极速扫描**：纯只读（`mmap` + 只读 SQLite）直接解析各 CLI / IDE 已落盘本地日志并在内存中实时规范化聚合，不挂代理、不注入 CLI Hook、不额外维护中间队列文件；`dashboard-v3.json` 结果快照秒开不置零
@@ -39,7 +40,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ### 方式一：从 Release 下载（推荐）
 
-[下载最新版本 v1.3.0 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
+[下载最新版本 v1.3.1 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
 1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
 2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
@@ -68,7 +69,7 @@ TOKENUSE_DEBUG=1 swift run
 `build.sh` 支持注入版本号与构建号（CI 自动传入）：
 
 ```bash
-MARKETING_VERSION=1.3.0 BUILD_NUMBER=1 ./build.sh
+MARKETING_VERSION=1.3.1 BUILD_NUMBER=1 ./build.sh
 ```
 
 ## 项目结构
@@ -93,14 +94,14 @@ token-use/
     │   ├── ProviderQuotaService.swift         # 5 大平台在线配额、官方计费分模型明细与 OAuth 续期
     │   └── SessionActivityMonitor.swift       # 5 大平台本地活跃会话实时状态监测器
     ├── Settings/
-    │   └── SettingsManager.swift              # 多账号配置、侧边栏停靠位置、平台排序与偏好持久化
+    │   └── SettingsManager.swift              # 多账号配置、账号脱敏、侧边栏停靠位置、平台排序与偏好持久化
     ├── Utilities/
     │   ├── KeychainStore.swift                # macOS Keychain 凭证安全存取
     │   ├── ReportManager.swift                # 汇总结果快照原子读写与自动清理（保留最近 5 份）
     │   └── ZstdDecompressor.swift             # 零链接依赖 libzstd / CLI 流式解压工具
     ├── Views/
     │   ├── ContentView.swift                  # 5 大平台 × 多账号电池配额卡片、跨端计费条与分模型面板
-    │   ├── SettingsView.swift                 # 多账号管理 + 侧边栏位置调节 + 平台排序 + 常规与更新页
+    │   ├── SettingsView.swift                 # 多账号管理 + 隐私脱敏 + 侧边栏位置调节 + 常规与更新页
     │   ├── XiaomiConsoleLoginSheet.swift      # 隔离会话的小米控制台 WebView 登录器
     │   ├── DonutChartView.swift               # Swift Charts 圆环图组件
     │   └── StatsPanelView.swift               # 指标统计卡片组件
@@ -122,6 +123,7 @@ token-use/
 
 ## 隐私与安全说明
 
+- 界面默认开启**账号名称隐私脱敏**（邮箱与中文备注自动打码展示，截屏与日常投屏不泄露敏感账号信息）。
 - 所有手动配置的 API Key、OAuth Token 与会话 Cookie 均仅保存在本机 **macOS Keychain**（`com.tokenuse.app.accounts`）中。
 - 本地会话扫描完全在离线本机以**只读方式**完成，不修改任何 CLI 原生日志，在线配额与计费请求仅直连各平台官方 API，无任何第三方遥测或中转服务。
 
@@ -133,7 +135,7 @@ token-use/
 ## 发布流程
 
 ```bash
-git tag v1.3.0
+git tag v1.3.1
 git push origin main --tags
 ```
 

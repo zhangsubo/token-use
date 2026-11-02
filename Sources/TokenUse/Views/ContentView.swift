@@ -111,6 +111,7 @@ struct TokenDashboardContent: View {
                                     group: group,
                                     isSessionActive: activityMonitor.activeProviders.contains(group.provider),
                                     showEstimatedCost: settings.showEstimatedCost,
+                                    maskAccountLabels: settings.maskAccountLabels,
                                     switchingAccountId: appState.switchingAccountId,
                                     onAddAccount: {
                                         openSettings(tab: .accounts, adding: group.provider)
@@ -190,7 +191,7 @@ struct TokenDashboardContent: View {
                 EdgeWindowManager.shared.isModalPresenting = false
             }
         ) { account in
-            XiaomiConsoleLoginSheet(accountLabel: account.label) { cookie in
+            XiaomiConsoleLoginSheet(accountLabel: settings.displayAccountLabel(account.label)) { cookie in
                 if account.source == .manual {
                     try? settings.saveManualAccount(account, secret: nil, consoleCookie: cookie)
                 } else {
@@ -584,6 +585,7 @@ private struct ProviderSectionCard: View {
     let group: ProviderGroupSnapshot
     let isSessionActive: Bool
     let showEstimatedCost: Bool
+    let maskAccountLabels: Bool
     let switchingAccountId: String?
     let onAddAccount: () -> Void
     let onBindXiaomiCookie: (String) -> Void
@@ -743,6 +745,7 @@ private struct ProviderSectionCard: View {
                             accent: group.provider.accentColor,
                             showInlineSpeed: group.accounts.count > 1,
                             showEstimatedCost: showEstimatedCost,
+                            maskAccountLabels: maskAccountLabels,
                             isSwitching: switchingAccountId == account.id,
                             onBindXiaomiCookie: { onBindXiaomiCookie(account.id) },
                             onSwitchCodexAccount: { onSwitchCodexAccount(account.id) }
@@ -820,6 +823,7 @@ private struct AccountQuotaCard: View {
     let accent: Color
     let showInlineSpeed: Bool
     let showEstimatedCost: Bool
+    let maskAccountLabels: Bool
     let isSwitching: Bool
     let onBindXiaomiCookie: () -> Void
     let onSwitchCodexAccount: () -> Void
@@ -864,7 +868,7 @@ private struct AccountQuotaCard: View {
                     .fill(statusDotColor)
                     .frame(width: 6.5, height: 6.5)
 
-                Text(account.label)
+                Text(maskAccountLabels ? SettingsManager.maskAccountLabel(account.label) : account.label)
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.95))
                     .lineLimit(1)

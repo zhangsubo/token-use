@@ -111,7 +111,7 @@ struct SettingsView: View {
             }
         }
         .sheet(item: $xiaomiLoginTarget) { account in
-            XiaomiConsoleLoginSheet(accountLabel: account.label) { cookie in
+            XiaomiConsoleLoginSheet(accountLabel: settings.displayAccountLabel(account.label)) { cookie in
                 if account.source == .manual {
                     try? settings.saveManualAccount(account, secret: nil, consoleCookie: cookie)
                 } else {
@@ -196,14 +196,27 @@ struct SettingsView: View {
             HStack(spacing: 8) {
                 Toggle("自动扫描本机配置", isOn: $settings.enableAutoDiscovery)
                     .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .controlSize(.mini)
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.white.opacity(0.88))
+                    .fixedSize()
                     .onChange(of: settings.enableAutoDiscovery) { _, _ in
                         Task { await appState.refresh() }
                     }
 
-                Spacer()
+                Divider()
+                    .frame(height: 13)
+                    .overlay(.white.opacity(0.18))
+
+                Toggle("账号脱敏", isOn: $settings.maskAccountLabels)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.88))
+                    .fixedSize()
+                    .help("默认开启：将邮箱与中文备注脱敏展示（如 ad*******om / 公**号）")
+
+                Spacer(minLength: 4)
 
                 Button {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
@@ -415,7 +428,7 @@ struct SettingsView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(account.label)
+                    Text(settings.displayAccountLabel(account.label))
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.white.opacity(account.isEnabled ? 0.94 : 0.45))
                         .lineLimit(1)
@@ -670,20 +683,37 @@ struct SettingsView: View {
     }
 
     private var displaySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("显示偏好")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.white)
 
-            Toggle("显示估算金额（按 API 单价折算等效价值 ≈ $）", isOn: $settings.showEstimatedCost)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .font(.system(size: 13.5))
-                .foregroundStyle(.white.opacity(0.9))
+            VStack(alignment: .leading, spacing: 5) {
+                Toggle("账号名称脱敏展示（如 ad*******om / 公**号）", isOn: $settings.maskAccountLabels)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(.white.opacity(0.9))
 
-            Text("关闭后将隐藏今日、近 90 天及各平台分组上的等效美元价值估算标签。")
-                .font(.system(size: 11.5))
-                .foregroundStyle(.white.opacity(0.5))
+                Text("默认开启，对展示的邮箱、中文自定义备注与账号 ID 自动打码保护隐私；编辑单个账号时仍保留原始名称。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            Divider()
+                .overlay(.white.opacity(0.10))
+
+            VStack(alignment: .leading, spacing: 5) {
+                Toggle("显示估算金额（按 API 单价折算等效价值 ≈ $）", isOn: $settings.showEstimatedCost)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(.white.opacity(0.9))
+
+                Text("关闭后将隐藏今日、近 90 天及各平台分组上的等效美元价值估算标签。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
         }
     }
 
@@ -1070,7 +1100,7 @@ private struct AccountEditorSheet: View {
         .preferredColorScheme(.dark)
         .onAppear(perform: populateInitialValues)
         .sheet(isPresented: $showXiaomiWebLogin) {
-            XiaomiConsoleLoginSheet(accountLabel: label.isEmpty ? "MiMo 账号" : label) { captured in
+            XiaomiConsoleLoginSheet(accountLabel: settings.displayAccountLabel(label.isEmpty ? "MiMo 账号" : label)) { captured in
                 consoleCookieInput = captured
                 if !isAutoDiscovered && authKind == .cookie && secretInput.isEmpty {
                     secretInput = captured
