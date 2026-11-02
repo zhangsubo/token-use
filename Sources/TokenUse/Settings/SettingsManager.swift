@@ -18,6 +18,9 @@ final class SettingsManager: ObservableObject {
         static let enableAutoDiscovery = "enableAutoDiscovery"
         static let showEstimatedCost = "showEstimatedCost"
         static let providerOrder = "providerOrder"
+        static let dockEdge = "dockEdge"
+        static let dockVerticalRatio = "dockVerticalRatio"
+        static let dockScreenID = "dockScreenID"
     }
 
     private struct PersistedAccountStore: Codable {
@@ -63,6 +66,41 @@ final class SettingsManager: ObservableObject {
         }
     }
 
+    /// 侧边栏贴靠屏幕边缘（支持 `.left` 贴左 / `.right` 贴右，默认 `.right`）
+    @Published var dockEdge: DockEdge {
+        didSet {
+            let normalized: DockEdge = (dockEdge == .left) ? .left : .right
+            if normalized != dockEdge {
+                dockEdge = normalized
+                return
+            }
+            defaults.set(normalized.rawValue, forKey: Keys.dockEdge)
+        }
+    }
+
+    /// 侧边栏垂直高度比例（`0.0` = 最上方，`0.5` = 居中默认，`1.0` = 最下方）
+    @Published var dockVerticalRatio: Double {
+        didSet {
+            let clamped = min(1.0, max(0.0, dockVerticalRatio))
+            if abs(clamped - dockVerticalRatio) > 0.000_001 {
+                dockVerticalRatio = clamped
+                return
+            }
+            defaults.set(clamped, forKey: Keys.dockVerticalRatio)
+        }
+    }
+
+    /// 多显示器场景下记录侧边栏所在屏幕 ID（缺省 `nil` 自动跟随主屏幕）
+    @Published var dockScreenID: UInt32? {
+        didSet {
+            if let dockScreenID {
+                defaults.set(Int(dockScreenID), forKey: Keys.dockScreenID)
+            } else {
+                defaults.removeObject(forKey: Keys.dockScreenID)
+            }
+        }
+    }
+
     @Published private(set) var manualAccounts: [ProviderAccountConfig] = []
     @Published private(set) var accountOverrides: [String: AccountOverride] = [:]
 
@@ -97,10 +135,42 @@ final class SettingsManager: ObservableObject {
 
         self.providerOrder = Self.normalizedProviderOrder(from: defaults.stringArray(forKey: Keys.providerOrder))
 
+        if let rawEdge = defaults.string(forKey: Keys.dockEdge),
+           let parsedEdge = DockEdge(rawValue: rawEdge),
+           parsedEdge == .left || parsedEdge == .right {
+            self.dockEdge = parsedEdge
+        } else {
+            self.dockEdge = .right
+        }
+
+        if defaults.object(forKey: Keys.dockVerticalRatio) == nil {
+            self.dockVerticalRatio = 0.5
+        } else {
+            self.dockVerticalRatio = min(1.0, max(0.0, defaults.double(forKey: Keys.dockVerticalRatio)))
+        }
+
+        if let rawScreen = defaults.object(forKey: Keys.dockScreenID) as? Int, rawScreen > 0 {
+            self.dockScreenID = UInt32(rawScreen)
+        } else {
+            self.dockScreenID = nil
+        }
+
         self.lastUpdateCheckDate = defaults.object(forKey: Keys.lastUpdateCheckDate) as? Date
         self.skippedVersion = defaults.string(forKey: Keys.skippedVersion)
 
         loadAccountStore()
+    }
+
+    // MARK: - Sidebar Position
+
+    var isDefaultDockPosition: Bool {
+        dockEdge == .right && abs(dockVerticalRatio - 0.5) < 0.005 && dockScreenID == nil
+    }
+
+    func resetDockPosition() {
+        dockScreenID = nil
+        dockEdge = .right
+        dockVerticalRatio = 0.5
     }
 
     // MARK: - Provider Display Order

@@ -515,6 +515,7 @@ struct SettingsView: View {
     private var generalTabContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                sidebarPositionSection
                 displaySection
                 providerOrderSection
                 refreshSection
@@ -523,6 +524,148 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
+        }
+    }
+
+    private var sidebarPositionSection: some View {
+        let verticalPresets: [(String, Double)] = [
+            ("顶部", 0.05),
+            ("偏上", 0.25),
+            ("居中", 0.50),
+            ("偏下", 0.75),
+            ("底部", 0.95),
+        ]
+        let verticalPercent = Int((settings.dockVerticalRatio * 100.0).rounded())
+        let verticalLabelText: String = {
+            if abs(settings.dockVerticalRatio - 0.5) < 0.02 {
+                return "垂直居中 (50%)"
+            }
+            return "距顶部 \(verticalPercent)%"
+        }()
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("侧边悬浮舱位置")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                if !settings.isDefaultDockPosition {
+                    Button("恢复默认位置") {
+                        settings.resetDockPosition()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            Text("可直接按住屏幕边缘的侧边栏自由拖动（贴左 / 贴右 / 上下移动，右键亦可快捷定位），或在此精确调节以避开其他工具。")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.white.opacity(0.52))
+
+            HStack(spacing: 10) {
+                ForEach(DockEdge.horizontalEdges) { candidate in
+                    let isSelected = settings.dockEdge == candidate
+                    Button {
+                        settings.dockEdge = candidate
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: candidate.iconName)
+                                .font(.system(size: 14, weight: .semibold))
+                            Text(candidate.displayName)
+                                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                            Spacer(minLength: 0)
+                            if isSelected {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(Color.cyan)
+                            }
+                        }
+                        .foregroundStyle(.white.opacity(isSelected ? 0.96 : 0.70))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(isSelected ? Color.cyan.opacity(0.18) : .white.opacity(0.055))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .stroke(
+                                            isSelected ? Color.cyan.opacity(0.58) : .white.opacity(0.12),
+                                            lineWidth: isSelected ? 1.0 : 0.7
+                                        )
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("上下高度")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.86))
+
+                    Text(verticalLabelText)
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.cyan.opacity(0.92))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.cyan.opacity(0.14)))
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        ForEach(verticalPresets, id: \.0) { preset in
+                            let isNear = abs(settings.dockVerticalRatio - preset.1) < 0.035
+                            Button {
+                                settings.dockVerticalRatio = preset.1
+                            } label: {
+                                Text(preset.0)
+                                    .font(.system(size: 11, weight: isNear ? .semibold : .regular))
+                                    .foregroundStyle(.white.opacity(isNear ? 0.96 : 0.68))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(
+                                        Capsule()
+                                            .fill(isNear ? Color.cyan.opacity(0.24) : .white.opacity(0.08))
+                                            .overlay(
+                                                Capsule()
+                                                    .stroke(
+                                                        isNear ? Color.cyan.opacity(0.55) : .white.opacity(0.12),
+                                                        lineWidth: 0.6
+                                                    )
+                                            )
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Text("顶部")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.52))
+
+                    Slider(value: $settings.dockVerticalRatio, in: 0.0...1.0)
+                        .tint(.cyan)
+
+                    Text("底部")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.52))
+                }
+            }
+            .padding(11)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.white.opacity(0.05))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(.white.opacity(0.11), lineWidth: 0.7)
+                    )
+            )
         }
     }
 

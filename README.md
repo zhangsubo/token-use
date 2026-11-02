@@ -17,8 +17,9 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 - **跨设备云端计费摘要条 & 可展开分模型明细面板**：
   - 即使其他电脑、远端服务器、Web 端或 API 渠道产生了消耗而本机无日志，也能通过官方计费接口捕获；自动以 `max(本机今日, 官方云端今日)` 对账展示今日 Token（悬停可对照云端与本机今日明细，且不污染按缓存单价折算的本机等效价值）
   - 每个账号卡片内嵌**官方跨端计费摘要条**，点击即可展开**分模型用量与计费面板**，自动归并同一模型并标注 `官方云端`、`云端+本机`、`本机日志` 三类来源徽章
-- **右侧毛玻璃环形停靠条（Edge Dock）+ 实时活跃转圈**：
-  - 屏幕边缘停靠条实时展示今日总 Token 与 **5 大平台剩余配额环形仪表盘**（Antigravity 圆环精准对齐当前活跃 IDE 的 **Gemini 配额池**），悬停滑出面板、图钉一键常驻
+- **可自由移动的毛玻璃环形侧边栏（Edge Dock）+ 实时活跃转圈**：
+  - 屏幕边缘停靠条实时展示今日总 Token 与 **5 大平台剩余配额环形仪表盘**（Antigravity 圆环精准对齐当前活跃 IDE 的 **Gemini 配额池**），悬停滑出面板、点击快速显隐、图钉一键常驻
+  - **防冲突自由定位（鼠标拖动 / 右键菜单 / 设置面板三端同步）**：支持直接用鼠标按住侧边栏**上下滑动**或跨屏拉动**磁吸贴靠屏幕左侧 / 右侧**（支持多显示器记忆，主面板跟随高度自动对齐），也可通过右键快捷菜单或在设置中通过快捷档位与无级滑块精确调节，彻底避免与其他边缘工具位置冲突
   - **会话运行实时感知**：轻量检测各平台本地活跃 Session，有会话正在生成时对应平台配额圆环切换为**流光旋转彗星环**（主面板同步显示「运行中」标签），会话单轮完成即自动增量刷新本地用量；空闲时零动画开销静止
 - **实测 `tok/s` 生成速率统计 & 2 列电池式配额卡片**：
   - 按各平台本地会话精确时间戳计算 `(输出 + 思考 Token) / 实测生成耗时`（自动剔除工具等待耗时），在平台标题栏、多账号卡片与展开明细中展示 **`⚡ tok/s` 平均速率与最近一轮速率**
@@ -38,7 +39,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ### 方式一：从 Release 下载（推荐）
 
-[下载最新版本 v1.2.0 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
+[下载最新版本 v1.3.0 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
 1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
 2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
@@ -67,7 +68,7 @@ TOKENUSE_DEBUG=1 swift run
 `build.sh` 支持注入版本号与构建号（CI 自动传入）：
 
 ```bash
-MARKETING_VERSION=1.2.0 BUILD_NUMBER=1 ./build.sh
+MARKETING_VERSION=1.3.0 BUILD_NUMBER=1 ./build.sh
 ```
 
 ## 项目结构
@@ -79,7 +80,7 @@ token-use/
 └── Sources/TokenUse/
     ├── AppDelegate.swift                      # 应用入口，LSUIElement + Settings 场景 + Sparkle 初始化
     ├── AppState.swift                         # 全局状态编排，快照秒开 + 云端计费与本机分模型融合对账
-    ├── EdgeWindowManager.swift                # 边缘环形仪表盘停靠条（活跃会话流光转圈）与 KeyablePanel
+    ├── EdgeWindowManager.swift                # 可拖动磁吸边缘停靠条（贴左/贴右/上下/多屏 + 活跃转圈）与 KeyablePanel
     ├── DebugLogger.swift                      # 按需调试日志（~/Library/Logs/TokenUse/）
     ├── Models/
     │   ├── ProviderModels.swift               # 5 大平台品牌图标、tok/s 速率、云端计费与分模型快照模型
@@ -92,14 +93,14 @@ token-use/
     │   ├── ProviderQuotaService.swift         # 5 大平台在线配额、官方计费分模型明细与 OAuth 续期
     │   └── SessionActivityMonitor.swift       # 5 大平台本地活跃会话实时状态监测器
     ├── Settings/
-    │   └── SettingsManager.swift              # 多账号配置、平台拖拽排序与偏好持久化
+    │   └── SettingsManager.swift              # 多账号配置、侧边栏停靠位置、平台排序与偏好持久化
     ├── Utilities/
     │   ├── KeychainStore.swift                # macOS Keychain 凭证安全存取
     │   ├── ReportManager.swift                # 汇总结果快照原子读写与自动清理（保留最近 5 份）
     │   └── ZstdDecompressor.swift             # 零链接依赖 libzstd / CLI 流式解压工具
     ├── Views/
     │   ├── ContentView.swift                  # 5 大平台 × 多账号电池配额卡片、跨端计费条与分模型面板
-    │   ├── SettingsView.swift                 # 多账号管理 + 平台拖拽排序 + 常规与更新设置页
+    │   ├── SettingsView.swift                 # 多账号管理 + 侧边栏位置调节 + 平台排序 + 常规与更新页
     │   ├── XiaomiConsoleLoginSheet.swift      # 隔离会话的小米控制台 WebView 登录器
     │   ├── DonutChartView.swift               # Swift Charts 圆环图组件
     │   └── StatsPanelView.swift               # 指标统计卡片组件
@@ -132,7 +133,7 @@ token-use/
 ## 发布流程
 
 ```bash
-git tag v1.2.0
+git tag v1.3.0
 git push origin main --tags
 ```
 

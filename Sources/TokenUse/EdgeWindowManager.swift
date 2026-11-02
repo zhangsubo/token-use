@@ -2,8 +2,33 @@ import AppKit
 import SwiftUI
 import Combine
 
-enum DockEdge {
-    case left, right, top, bottom
+enum DockEdge: String, Codable, CaseIterable, Identifiable, Sendable {
+    case left = "left"
+    case right = "right"
+    case top = "top"
+    case bottom = "bottom"
+
+    var id: String { rawValue }
+
+    static let horizontalEdges: [DockEdge] = [.left, .right]
+
+    var displayName: String {
+        switch self {
+        case .left: return "贴靠左侧"
+        case .right: return "贴靠右侧"
+        case .top: return "顶部"
+        case .bottom: return "底部"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .left: return "sidebar.left"
+        case .right: return "sidebar.right"
+        case .top: return "menubar.rectangle"
+        case .bottom: return "dock.rectangle"
+        }
+    }
 
     var screenEdge: NSRectEdge {
         switch self {
@@ -19,12 +44,81 @@ enum DockEdge {
 final class TriggerState: ObservableObject {
     static let shared = TriggerState()
     @Published var isHovered = false
+    @Published var isDragging = false
+    @Published var activeEdge: DockEdge = .right
     private init() {}
 }
 
 private final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+}
+
+/// 支持鼠标直接按住拖动与右键快捷定位的边缘侧边栏悬浮窗（不抢占当前前台应用焦点）
+@MainActor
+private final class DraggableTriggerPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    private var dragStartMouse: NSPoint = .zero
+    private var dragGrabOffset: NSPoint = .zero
+    private var isTrackingLeftPress: Bool = false
+    private var didExceedDragThreshold: Bool = false
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            let mouse = NSEvent.mouseLocation
+            dragStartMouse = mouse
+            dragGrabOffset = NSPoint(x: mouse.x - frame.origin.x, y: mouse.y - frame.origin.y)
+            isTrackingLeftPress = true
+            didExceedDragThreshold = false
+            EdgeWindowManager.shared.prepareDockPress()
+            return
+
+        case .leftMouseDragged:
+            guard isTrackingLeftPress else {
+                super.sendEvent(event)
+                return
+            }
+            let mouse = NSEvent.mouseLocation
+            if !didExceedDragThreshold {
+                let dist = hypot(mouse.x - dragStartMouse.x, mouse.y - dragStartMouse.y)
+                guard dist >= 3.0 else { return }
+                didExceedDragThreshold = true
+                NSCursor.closedHand.push()
+                EdgeWindowManager.shared.beginDockDrag()
+            }
+            EdgeWindowManager.shared.updateDockDrag(mouseLocation: mouse, grabOffset: dragGrabOffset)
+            return
+
+        case .leftMouseUp:
+            guard isTrackingLeftPress else {
+                super.sendEvent(event)
+                return
+            }
+            isTrackingLeftPress = false
+            if didExceedDragThreshold {
+                didExceedDragThreshold = false
+                NSCursor.pop()
+                EdgeWindowManager.shared.endDockDrag(mouseLocation: NSEvent.mouseLocation)
+            } else {
+                EdgeWindowManager.shared.handleDockClick()
+            }
+            return
+
+        case .rightMouseDown:
+            if let view = contentView {
+                let menu = EdgeWindowManager.shared.buildDockContextMenu()
+                NSMenu.popUpContextMenu(menu, with: event, for: view)
+                return
+            }
+            super.sendEvent(event)
+
+        default:
+            super.sendEvent(event)
+        }
+    }
 }
 
 @MainActor
@@ -36,16 +130,26 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private var isVisible = false
     private var edge: DockEdge = .right
     private let triggerWidth: CGFloat = 50
-    private let triggerHeight: CGFloat = 236
+    private let triggerHeight: CGFloat = 244
+    private let verticalMargin: CGFloat = 8
+    private let magneticSnapDistance: CGFloat = 96
     private let panelWidth: CGFloat = 644
     private let panelHeight: CGFloat = 670
     private let panelEdgeInset: CGFloat = 60
+    private let showDelay: TimeInterval = 0.10
     private let hideDelay: TimeInterval = 0.3
 
+    private var showTimer: Timer?
     private var hideTimer: Timer?
     private var mouseMonitor: Any?
     private var localMouseMonitor: Any?
     private var screenObserver: NSObjectProtocol?
+    private var cancellables = Set<AnyCancellable>()
+
+    private var isPressingDock = false
+    private var isDraggingDock = false
+    private var isUpdatingSettingsFromDrag = false
+    private var suppressHoverOpenUntil: Date = .distantPast
 
     /// 当设置弹窗 / 登录窗口打开或用户固定面板时，阻止鼠标移出自动收起
     @Published var isPinned: Bool = false
@@ -64,10 +168,80 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     func setup() {
+        let initialEdge = SettingsManager.shared.dockEdge
+        self.edge = initialEdge
+        TriggerState.shared.activeEdge = initialEdge
+
         createTriggerWindow()
         createPanelWindow()
         startMouseMonitoring()
         observeScreenChanges()
+        observeSettingsChanges()
+    }
+
+    // MARK: - Screen Resolution Helpers
+
+    private static func displayID(for screen: NSScreen) -> UInt32? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    private func targetScreen() -> NSScreen? {
+        if let savedID = SettingsManager.shared.dockScreenID,
+           let matched = NSScreen.screens.first(where: { Self.displayID(for: $0) == savedID }) {
+            return matched
+        }
+        return NSScreen.main ?? NSScreen.screens.first
+    }
+
+    private func screenContaining(point: NSPoint) -> NSScreen? {
+        NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) }
+    }
+
+    private func computedTriggerRect(on screen: NSScreen, edge: DockEdge, verticalRatio: Double) -> NSRect {
+        let screenFrame = screen.visibleFrame
+        let clampedRatio = min(1.0, max(0.0, verticalRatio))
+        let minY = screenFrame.minY + verticalMargin
+        let maxY = max(minY, screenFrame.maxY - triggerHeight - verticalMargin)
+        let y = minY + CGFloat(1.0 - clampedRatio) * (maxY - minY)
+
+        switch edge {
+        case .right:
+            return NSRect(
+                x: screenFrame.maxX - triggerWidth,
+                y: y,
+                width: triggerWidth,
+                height: triggerHeight
+            )
+        case .left:
+            return NSRect(
+                x: screenFrame.minX,
+                y: y,
+                width: triggerWidth,
+                height: triggerHeight
+            )
+        case .top:
+            return NSRect(
+                x: screenFrame.midX - triggerHeight / 2,
+                y: screenFrame.maxY - triggerWidth,
+                width: triggerHeight,
+                height: triggerWidth
+            )
+        case .bottom:
+            return NSRect(
+                x: screenFrame.midX - triggerHeight / 2,
+                y: screenFrame.minY,
+                width: triggerHeight,
+                height: triggerWidth
+            )
+        }
+    }
+
+    /// 让滑出主面板垂直方向跟随侧边栏中心高度（并严格钳制在屏幕可视安全边界内，确保鼠标水平移入主面板永不落空）
+    private func alignedPanelY(in screenFrame: NSRect, triggerRect: NSRect) -> CGFloat {
+        let idealY = triggerRect.midY - panelHeight / 2
+        let minY = screenFrame.minY + 10
+        let maxY = max(minY, screenFrame.maxY - panelHeight - 10)
+        return min(max(idealY, minY), maxY)
     }
 
     // MARK: - Window Creation
@@ -100,57 +274,30 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     private func createTriggerWindow() {
-        let screen = NSScreen.main ?? NSScreen.screens.first!
-        let screenFrame = screen.visibleFrame
+        guard let screen = targetScreen() else { return }
+        let triggerRect = computedTriggerRect(
+            on: screen,
+            edge: edge,
+            verticalRatio: SettingsManager.shared.dockVerticalRatio
+        )
 
-        let triggerRect: NSRect
-        switch edge {
-        case .right:
-            triggerRect = NSRect(
-                x: screenFrame.maxX - triggerWidth,
-                y: screenFrame.midY - triggerHeight / 2,
-                width: triggerWidth,
-                height: triggerHeight
-            )
-        case .left:
-            triggerRect = NSRect(
-                x: screenFrame.minX,
-                y: screenFrame.midY - triggerHeight / 2,
-                width: triggerWidth,
-                height: triggerHeight
-            )
-        case .top:
-            triggerRect = NSRect(
-                x: screenFrame.midX - triggerHeight / 2,
-                y: screenFrame.maxY - triggerWidth,
-                width: triggerHeight,
-                height: triggerWidth
-            )
-        case .bottom:
-            triggerRect = NSRect(
-                x: screenFrame.midX - triggerHeight / 2,
-                y: screenFrame.minY,
-                width: triggerHeight,
-                height: triggerWidth
-            )
-        }
-
-        let trigger = NSPanel(
+        let trigger = DraggableTriggerPanel(
             contentRect: triggerRect,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
 
-        trigger.level = .floating
+        trigger.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
         trigger.appearance = NSAppearance(named: .darkAqua)
         trigger.backgroundColor = .clear
         trigger.isOpaque = false
         trigger.hasShadow = false
-        trigger.ignoresMouseEvents = true
+        trigger.ignoresMouseEvents = false
+        trigger.isMovable = false
         trigger.collectionBehavior = [.canJoinAllSpaces, .stationary]
 
-        let hostingView = NSHostingView(rootView: TriggerIndicator(edge: edge))
+        let hostingView = NSHostingView(rootView: TriggerIndicator())
         hostingView.frame = trigger.contentView?.bounds ?? triggerRect
         hostingView.autoresizingMask = [.width, .height]
         trigger.contentView = hostingView
@@ -162,22 +309,28 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     // MARK: - Positioning
 
     private func positionPanelHidden() {
-        guard let window, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        guard let window, let screen = targetScreen() else { return }
         let frame = screen.visibleFrame
+        let tRect = triggerView?.frame ?? computedTriggerRect(
+            on: screen,
+            edge: edge,
+            verticalRatio: SettingsManager.shared.dockVerticalRatio
+        )
+        let panelY = alignedPanelY(in: frame, triggerRect: tRect)
 
-        var targetRect: NSRect
+        let targetRect: NSRect
         switch edge {
         case .right:
             targetRect = NSRect(
                 x: frame.maxX,
-                y: frame.midY - panelHeight / 2,
+                y: panelY,
                 width: panelWidth,
                 height: panelHeight
             )
         case .left:
             targetRect = NSRect(
-                x: -panelWidth,
-                y: frame.midY - panelHeight / 2,
+                x: frame.minX - panelWidth,
+                y: panelY,
                 width: panelWidth,
                 height: panelHeight
             )
@@ -191,7 +344,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         case .bottom:
             targetRect = NSRect(
                 x: frame.midX - panelWidth / 2,
-                y: -panelHeight,
+                y: frame.minY - panelHeight,
                 width: panelWidth,
                 height: panelHeight
             )
@@ -200,23 +353,29 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         window.setFrame(targetRect, display: true, animate: false)
     }
 
-    private func positionPanelVisible() {
-        guard let window, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+    private func positionPanelVisible(animated: Bool = true) {
+        guard let window, let screen = targetScreen() else { return }
         let frame = screen.visibleFrame
+        let tRect = triggerView?.frame ?? computedTriggerRect(
+            on: screen,
+            edge: edge,
+            verticalRatio: SettingsManager.shared.dockVerticalRatio
+        )
+        let panelY = alignedPanelY(in: frame, triggerRect: tRect)
 
-        var targetRect: NSRect
+        let targetRect: NSRect
         switch edge {
         case .right:
             targetRect = NSRect(
                 x: max(frame.minX, frame.maxX - panelWidth - panelEdgeInset),
-                y: frame.midY - panelHeight / 2,
+                y: panelY,
                 width: panelWidth,
                 height: panelHeight
             )
         case .left:
             targetRect = NSRect(
                 x: min(frame.maxX - panelWidth, frame.minX + panelEdgeInset),
-                y: frame.midY - panelHeight / 2,
+                y: panelY,
                 width: panelWidth,
                 height: panelHeight
             )
@@ -236,14 +395,206 @@ final class EdgeWindowManager: NSObject, ObservableObject {
             )
         }
 
-        window.setFrame(targetRect, display: true, animate: true)
+        window.setFrame(targetRect, display: true, animate: animated)
+    }
+
+    // MARK: - Drag & Context Menu Handling
+
+    fileprivate func prepareDockPress() {
+        isPressingDock = true
+        cancelShowTimer()
+        cancelHideTimer()
+    }
+
+    fileprivate func beginDockDrag() {
+        isDraggingDock = true
+        TriggerState.shared.isDragging = true
+        TriggerState.shared.isHovered = true
+        cancelShowTimer()
+        cancelHideTimer()
+
+        if isVisible && !isModalPresenting && !isPinned {
+            isVisible = false
+            positionPanelHidden()
+            window?.orderOut(nil)
+        }
+    }
+
+    fileprivate func updateDockDrag(mouseLocation: NSPoint, grabOffset: NSPoint) {
+        guard let triggerView,
+              let screen = screenContaining(point: mouseLocation) ?? targetScreen() else {
+            return
+        }
+        let vf = screen.visibleFrame
+        let minY = vf.minY + verticalMargin
+        let maxY = max(minY, vf.maxY - triggerHeight - verticalMargin)
+        let clampedY = min(max(mouseLocation.y - grabOffset.y, minY), maxY)
+
+        let liveEdge: DockEdge = (mouseLocation.x < vf.midX) ? .left : .right
+        if TriggerState.shared.activeEdge != liveEdge {
+            TriggerState.shared.activeEdge = liveEdge
+        }
+
+        let targetX: CGFloat
+        if mouseLocation.x - vf.minX <= magneticSnapDistance {
+            targetX = vf.minX
+        } else if vf.maxX - mouseLocation.x <= magneticSnapDistance {
+            targetX = vf.maxX - triggerWidth
+        } else {
+            let rawX = mouseLocation.x - grabOffset.x
+            targetX = min(max(rawX, vf.minX), vf.maxX - triggerWidth)
+        }
+
+        triggerView.setFrameOrigin(NSPoint(x: targetX, y: clampedY))
+        if isVisible {
+            edge = liveEdge
+            positionPanelVisible(animated: false)
+        }
+    }
+
+    fileprivate func endDockDrag(mouseLocation: NSPoint) {
+        isPressingDock = false
+        isDraggingDock = false
+        TriggerState.shared.isDragging = false
+        suppressHoverOpenUntil = Date().addingTimeInterval(0.28)
+
+        guard let triggerView,
+              let screen = screenContaining(point: mouseLocation) ?? targetScreen() else {
+            return
+        }
+
+        let vf = screen.visibleFrame
+        let finalEdge: DockEdge = (mouseLocation.x < vf.midX) ? .left : .right
+        let minY = vf.minY + verticalMargin
+        let maxY = max(minY, vf.maxY - triggerHeight - verticalMargin)
+        let clampedY = min(max(triggerView.frame.origin.y, minY), maxY)
+        let travel = maxY - minY
+        let finalRatio: Double = travel > 0
+            ? min(1.0, max(0.0, 1.0 - Double((clampedY - minY) / travel)))
+            : 0.5
+
+        edge = finalEdge
+        TriggerState.shared.activeEdge = finalEdge
+
+        isUpdatingSettingsFromDrag = true
+        let settings = SettingsManager.shared
+        settings.dockScreenID = Self.displayID(for: screen)
+        settings.dockEdge = finalEdge
+        settings.dockVerticalRatio = finalRatio
+        isUpdatingSettingsFromDrag = false
+
+        let snappedRect = computedTriggerRect(on: screen, edge: finalEdge, verticalRatio: finalRatio)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            triggerView.animator().setFrame(snappedRect, display: true)
+        }
+
+        if isVisible {
+            positionPanelVisible(animated: true)
+        } else {
+            positionPanelHidden()
+        }
+    }
+
+    fileprivate func handleDockClick() {
+        isPressingDock = false
+        if isVisible && !isPinned && !isModalPresenting {
+            performHide()
+        } else {
+            showPanel()
+        }
+    }
+
+    fileprivate func buildDockContextMenu() -> NSMenu {
+        let menu = NSMenu(title: "侧边栏位置")
+        let settings = SettingsManager.shared
+
+        let leftItem = NSMenuItem(title: "贴靠屏幕左侧", action: #selector(selectDockLeft), keyEquivalent: "")
+        leftItem.target = self
+        leftItem.state = (settings.dockEdge == .left) ? .on : .off
+        menu.addItem(leftItem)
+
+        let rightItem = NSMenuItem(title: "贴靠屏幕右侧", action: #selector(selectDockRight), keyEquivalent: "")
+        rightItem.target = self
+        rightItem.state = (settings.dockEdge == .right) ? .on : .off
+        menu.addItem(rightItem)
+
+        menu.addItem(.separator())
+
+        let presets: [(String, Double)] = [
+            ("移至顶部", 0.05),
+            ("移至偏上", 0.25),
+            ("垂直居中", 0.50),
+            ("移至偏下", 0.75),
+            ("移至底部", 0.95),
+        ]
+        for (title, ratio) in presets {
+            let item = NSMenuItem(title: title, action: #selector(selectVerticalPreset(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: ratio)
+            if abs(settings.dockVerticalRatio - ratio) < 0.06 {
+                item.state = .on
+            }
+            menu.addItem(item)
+        }
+
+        if !settings.isDefaultDockPosition {
+            menu.addItem(.separator())
+            let resetItem = NSMenuItem(title: "恢复默认位置（右侧居中）", action: #selector(resetDockToDefault), keyEquivalent: "")
+            resetItem.target = self
+            menu.addItem(resetItem)
+        }
+
+        return menu
+    }
+
+    @objc private func selectDockLeft() {
+        SettingsManager.shared.dockEdge = .left
+    }
+
+    @objc private func selectDockRight() {
+        SettingsManager.shared.dockEdge = .right
+    }
+
+    @objc private func selectVerticalPreset(_ sender: NSMenuItem) {
+        guard let num = sender.representedObject as? NSNumber else { return }
+        SettingsManager.shared.dockVerticalRatio = num.doubleValue
+    }
+
+    @objc private func resetDockToDefault() {
+        SettingsManager.shared.resetDockPosition()
     }
 
     // MARK: - Show / Hide
 
-    func showPanel() {
+    private func scheduleShowPanel() {
         cancelHideTimer()
+        guard !isVisible, !isPressingDock, !isDraggingDock else { return }
+        guard Date() >= suppressHoverOpenUntil else { return }
+        guard showTimer == nil else { return }
+
+        showTimer = Timer.scheduledTimer(withTimeInterval: showDelay, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.showTimer = nil
+                guard !self.isPressingDock, !self.isDraggingDock else { return }
+                self.showPanel()
+            }
+        }
+    }
+
+    private func cancelShowTimer() {
+        showTimer?.invalidate()
+        showTimer = nil
+    }
+
+    func showPanel() {
+        cancelShowTimer()
+        cancelHideTimer()
+        guard !isDraggingDock else { return }
         guard !isVisible else { return }
+        positionPanelHidden()
         isVisible = true
 
         window?.orderFront(nil)
@@ -251,12 +602,13 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.25
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            positionPanelVisible()
+            positionPanelVisible(animated: true)
         }
     }
 
     func hidePanel() {
-        guard isVisible, !isPinned, !isModalPresenting else { return }
+        cancelShowTimer()
+        guard isVisible, !isPinned, !isModalPresenting, !isDraggingDock else { return }
 
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: hideDelay, repeats: false) { [weak self] _ in
@@ -273,7 +625,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     private func performHide() {
-        guard isVisible, !isPinned, !isModalPresenting else { return }
+        guard isVisible, !isPinned, !isModalPresenting, !isDraggingDock else { return }
         isVisible = false
 
         NSAnimationContext.runAnimationGroup { context in
@@ -287,7 +639,55 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Screen & Mouse Monitoring
+    // MARK: - Screen, Settings & Mouse Monitoring
+
+    private func observeSettingsChanges() {
+        let settings = SettingsManager.shared
+
+        settings.$dockEdge
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newEdge in
+                guard let self, !self.isUpdatingSettingsFromDrag, !self.isDraggingDock else { return }
+                self.edge = newEdge
+                TriggerState.shared.activeEdge = newEdge
+                self.repositionTriggerWindow(animated: true)
+                if self.isVisible {
+                    self.positionPanelVisible(animated: true)
+                } else {
+                    self.positionPanelHidden()
+                }
+            }
+            .store(in: &cancellables)
+
+        settings.$dockVerticalRatio
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, !self.isUpdatingSettingsFromDrag, !self.isDraggingDock else { return }
+                self.repositionTriggerWindow(animated: false)
+                if self.isVisible {
+                    self.positionPanelVisible(animated: false)
+                } else {
+                    self.positionPanelHidden()
+                }
+            }
+            .store(in: &cancellables)
+
+        settings.$dockScreenID
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, !self.isUpdatingSettingsFromDrag, !self.isDraggingDock else { return }
+                self.repositionTriggerWindow(animated: true)
+                if self.isVisible {
+                    self.positionPanelVisible(animated: true)
+                } else {
+                    self.positionPanelHidden()
+                }
+            }
+            .store(in: &cancellables)
+    }
 
     private func observeScreenChanges() {
         screenObserver = NotificationCenter.default.addObserver(
@@ -297,9 +697,9 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.repositionTriggerWindow()
+                self.repositionTriggerWindow(animated: false)
                 if self.isVisible {
-                    self.positionPanelVisible()
+                    self.positionPanelVisible(animated: false)
                 } else {
                     self.positionPanelHidden()
                 }
@@ -307,41 +707,14 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         }
     }
 
-    private func repositionTriggerWindow() {
-        guard let triggerView, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
-        let screenFrame = screen.visibleFrame
-        let triggerRect: NSRect
-        switch edge {
-        case .right:
-            triggerRect = NSRect(
-                x: screenFrame.maxX - triggerWidth,
-                y: screenFrame.midY - triggerHeight / 2,
-                width: triggerWidth,
-                height: triggerHeight
-            )
-        case .left:
-            triggerRect = NSRect(
-                x: screenFrame.minX,
-                y: screenFrame.midY - triggerHeight / 2,
-                width: triggerWidth,
-                height: triggerHeight
-            )
-        case .top:
-            triggerRect = NSRect(
-                x: screenFrame.midX - triggerHeight / 2,
-                y: screenFrame.maxY - triggerWidth,
-                width: triggerHeight,
-                height: triggerWidth
-            )
-        case .bottom:
-            triggerRect = NSRect(
-                x: screenFrame.midX - triggerHeight / 2,
-                y: screenFrame.minY,
-                width: triggerHeight,
-                height: triggerWidth
-            )
-        }
-        triggerView.setFrame(triggerRect, display: true)
+    private func repositionTriggerWindow(animated: Bool = false) {
+        guard let triggerView, let screen = targetScreen() else { return }
+        let triggerRect = computedTriggerRect(
+            on: screen,
+            edge: edge,
+            verticalRatio: SettingsManager.shared.dockVerticalRatio
+        )
+        triggerView.setFrame(triggerRect, display: true, animate: animated)
     }
 
     private func startMouseMonitoring() {
@@ -363,19 +736,20 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     private func handleMouseMove() {
+        guard !isDraggingDock, !isPressingDock else { return }
         let mouseLoc = NSEvent.mouseLocation
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        guard let screen = targetScreen() else { return }
         let frame = screen.visibleFrame
 
         let isInTriggerZone = isMouseInTriggerZone(mouseLoc, frame: frame)
-        let isInPanel = isMouseInPanel(mouseLoc)
+        let isInPanel = isVisible && isMouseInPanel(mouseLoc)
 
         if isInTriggerZone {
             TriggerState.shared.isHovered = true
-            showPanel()
+            scheduleShowPanel()
         } else if isInPanel {
             TriggerState.shared.isHovered = false
-            showPanel()
+            cancelHideTimer()
         } else {
             TriggerState.shared.isHovered = false
             hidePanel()
@@ -392,7 +766,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private func isMouseInPanel(_ mouseLoc: NSPoint) -> Bool {
         guard let window else { return false }
         let frame = window.frame
-        let expanded = frame.insetBy(dx: -10, dy: -10)
+        let expanded = frame.insetBy(dx: -12, dy: -10)
         return expanded.contains(mouseLoc)
     }
 }
@@ -400,18 +774,19 @@ final class EdgeWindowManager: NSObject, ObservableObject {
 // MARK: - TriggerIndicator (Frosted Edge Dock with Live Provider Quota Rings)
 
 struct TriggerIndicator: View {
-    let edge: DockEdge
     @StateObject private var state = TriggerState.shared
     @StateObject private var appState = AppState.shared
 
     var body: some View {
         ZStack {
-            switch edge {
+            switch state.activeEdge {
             case .right:
                 HStack {
                     Spacer(minLength: 0)
                     TriggerCapsuleWithArrow(
-                        isHovered: state.isHovered,
+                        edge: .right,
+                        isHovered: state.isHovered || state.isDragging,
+                        isDragging: state.isDragging,
                         isVertical: true,
                         dashboard: appState.dashboard
                     )
@@ -420,7 +795,9 @@ struct TriggerIndicator: View {
             case .left:
                 HStack {
                     TriggerCapsuleWithArrow(
-                        isHovered: state.isHovered,
+                        edge: .left,
+                        isHovered: state.isHovered || state.isDragging,
+                        isDragging: state.isDragging,
                         isVertical: true,
                         dashboard: appState.dashboard
                     )
@@ -430,7 +807,9 @@ struct TriggerIndicator: View {
             case .top:
                 VStack {
                     TriggerCapsuleWithArrow(
-                        isHovered: state.isHovered,
+                        edge: .top,
+                        isHovered: state.isHovered || state.isDragging,
+                        isDragging: state.isDragging,
                         isVertical: false,
                         dashboard: appState.dashboard
                     )
@@ -441,7 +820,9 @@ struct TriggerIndicator: View {
                 VStack {
                     Spacer(minLength: 0)
                     TriggerCapsuleWithArrow(
-                        isHovered: state.isHovered,
+                        edge: .bottom,
+                        isHovered: state.isHovered || state.isDragging,
+                        isDragging: state.isDragging,
                         isVertical: false,
                         dashboard: appState.dashboard
                     )
@@ -449,11 +830,14 @@ struct TriggerIndicator: View {
                 }
             }
         }
+        .help("按住可自由拖动到屏幕左/右侧或上下任意高度 · 右键可快捷定位")
     }
 }
 
 private struct TriggerCapsuleWithArrow: View {
+    let edge: DockEdge
     let isHovered: Bool
+    let isDragging: Bool
     let isVertical: Bool
     let dashboard: MultiAccountDashboard?
     @ObservedObject private var settings = SettingsManager.shared
@@ -463,6 +847,10 @@ private struct TriggerCapsuleWithArrow: View {
         NumberFormatterUtil.formatCompact(dashboard?.totalTodayTokens ?? 0)
     }
 
+    private var chevronIconName: String {
+        edge == .left ? "chevron.right" : "chevron.left"
+    }
+
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 21, style: .continuous)
@@ -470,8 +858,8 @@ private struct TriggerCapsuleWithArrow: View {
                     LinearGradient(
                         colors: isHovered
                             ? [
-                                Color(.sRGB, red: 0.25, green: 0.34, blue: 0.56).opacity(0.92),
-                                Color(.sRGB, red: 0.16, green: 0.22, blue: 0.40).opacity(0.94),
+                                Color(.sRGB, red: 0.25, green: 0.34, blue: 0.56).opacity(0.94),
+                                Color(.sRGB, red: 0.16, green: 0.22, blue: 0.40).opacity(0.96),
                             ]
                             : [
                                 Color(.sRGB, red: 0.20, green: 0.26, blue: 0.42).opacity(0.76),
@@ -496,16 +884,27 @@ private struct TriggerCapsuleWithArrow: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 21, style: .continuous)
-                        .stroke(.white.opacity(isHovered ? 0.42 : 0.18), lineWidth: 0.7)
+                        .stroke(
+                            isDragging
+                                ? Color.cyan.opacity(0.75)
+                                : .white.opacity(isHovered ? 0.42 : 0.18),
+                            lineWidth: isDragging ? 1.1 : 0.7
+                        )
                 )
-                .shadow(color: .black.opacity(isHovered ? 0.28 : 0.16), radius: 6, x: 0, y: 2)
+                .shadow(color: .black.opacity(isHovered ? 0.30 : 0.16), radius: isDragging ? 10 : 6, x: 0, y: 2)
                 .shadow(
                     color: Color(.sRGB, red: 0.357, green: 0.522, blue: 1.0).opacity(isHovered ? 0.48 : 0.10),
                     radius: isHovered ? 14 : 5
                 )
 
             if isVertical {
-                VStack(spacing: 5.5) {
+                VStack(spacing: 5) {
+                    // 顶部微缩抓手指示条（提示支持按住拖动）
+                    Capsule()
+                        .fill(.white.opacity(isHovered ? 0.52 : 0.22))
+                        .frame(width: 14, height: 2.5)
+                        .padding(.bottom, 1)
+
                     VStack(spacing: 0.5) {
                         Text("TODAY")
                             .font(.system(size: 6.5, weight: .bold, design: .rounded))
@@ -533,12 +932,12 @@ private struct TriggerCapsuleWithArrow: View {
                         }
                     }
 
-                    Image(systemName: "chevron.left")
+                    Image(systemName: chevronIconName)
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.white.opacity(isHovered ? 0.90 : 0.45))
                         .padding(.top, 1)
                 }
-                .padding(.vertical, 9)
+                .padding(.vertical, 8)
             } else {
                 HStack(spacing: 6) {
                     Text(todayText)
@@ -556,7 +955,9 @@ private struct TriggerCapsuleWithArrow: View {
                 .padding(.horizontal, 10)
             }
         }
-        .frame(width: isVertical ? 42 : 224, height: isVertical ? 224 : 42)
+        .frame(width: isVertical ? 42 : 232, height: isVertical ? 232 : 42)
+        .scaleEffect(isDragging ? 1.03 : 1.0)
+        .animation(.easeOut(duration: 0.14), value: isDragging)
     }
 }
 
