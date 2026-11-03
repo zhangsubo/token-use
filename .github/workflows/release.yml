@@ -150,7 +150,7 @@ jobs:
 
           ITEM=$(cat <<XML
               <item>
-                  <title>Version ${VERSION}</title>
+                  <title>TokenUse ${VERSION}</title>
                   <sparkle:version>${BUILD_NUMBER}</sparkle:version>
                   <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
                   <pubDate>${PUB_DATE}</pubDate>

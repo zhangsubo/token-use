@@ -29,7 +29,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
   - **平台展示顺序自由拖拽**：在设置中按平台拖拽调整展示顺序，主面板、顶部筛选栏、边缘停靠条与多账号管理页全局实时同步
   - **等效 API 折算价值（`≈ $x,xxx.xx`）**：基于 LiteLLM 分级定价折算等效 API 价值并附悬停说明，支持在设置中一键隐藏估算金额
 - **零侵入单遍极速扫描**：纯只读（`mmap` + 只读 SQLite）直接解析各 CLI / IDE 已落盘本地日志并在内存中实时规范化聚合，不挂代理、不注入 CLI Hook、不额外维护中间队列文件；`dashboard-v3.json` 结果快照秒开不置零
-- **Sparkle 2.x 自动更新**：EdDSA 签名校验，应用内自动检测并升级
+- **Sparkle 2.x 全中文自动更新**：EdDSA 签名校验，应用内自动检测并升级，内置全流程简体中文更新提示界面
 
 ## 系统要求
 
@@ -40,7 +40,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ### 方式一：从 Release 下载（推荐）
 
-[下载最新版本 v1.3.1 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
+[下载最新版本 v1.3.2 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
 1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
 2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
@@ -69,7 +69,7 @@ TOKENUSE_DEBUG=1 swift run
 `build.sh` 支持注入版本号与构建号（CI 自动传入）：
 
 ```bash
-MARKETING_VERSION=1.3.1 BUILD_NUMBER=1 ./build.sh
+MARKETING_VERSION=1.3.2 BUILD_NUMBER=1 ./build.sh
 ```
 
 ## 项目结构
@@ -105,6 +105,9 @@ token-use/
     │   ├── XiaomiConsoleLoginSheet.swift      # 隔离会话的小米控制台 WebView 登录器
     │   ├── DonutChartView.swift               # Swift Charts 圆环图组件
     │   └── StatsPanelView.swift               # 指标统计卡片组件
+    ├── Localization/
+    │   ├── InfoPlist.strings                  # 主包简体中文本地化声明
+    │   └── Sparkle.strings                    # Sparkle 2.x 全套简体中文更新界面文案
     └── Resources/
         ├── AppIcon.icns                       # 应用图标
         ├── provider-*.png                     # 5 大平台品牌图标资源
@@ -135,7 +138,7 @@ token-use/
 ## 发布流程
 
 ```bash
-git tag v1.3.1
+git tag v1.3.2
 git push origin main --tags
 ```
 

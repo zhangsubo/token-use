@@ -3,7 +3,7 @@
 # TokenUse.app 打包脚本
 #
 # 输入 env:
-#   MARKETING_VERSION  默认 1.3.1    （CFBundleShortVersionString，对应 git tag v*.*.*）
+#   MARKETING_VERSION  默认 1.3.2    （CFBundleShortVersionString，对应 git tag v*.*.*）
 #   BUILD_NUMBER       默认 1        （CFBundleVersion，对应 GitHub Actions run_number）
 #
 # 产物：
@@ -18,7 +18,7 @@ RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 ZIP_NAME="${APP_NAME}.zip"
 PROJECT_DIR="$(pwd -P)"
 
-MARKETING_VERSION="${MARKETING_VERSION:-1.3.1}"
+MARKETING_VERSION="${MARKETING_VERSION:-1.3.2}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache-physical"
@@ -69,10 +69,28 @@ if [ -d "$SPARKLE_FW_SRC" ]; then
         lipo -remove x86_64 "$SPARKLE_BIN" -output "$SPARKLE_BIN.tmp"
         mv "$SPARKLE_BIN.tmp" "$SPARKLE_BIN"
     fi
+    if [ -f "Sources/TokenUse/Localization/Sparkle.strings" ]; then
+        SPARKLE_RES="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Resources"
+        mkdir -p "$SPARKLE_RES/zh_CN.lproj" "$SPARKLE_RES/zh-Hans.lproj"
+        plutil -convert binary1 -o "$SPARKLE_RES/zh_CN.lproj/Sparkle.strings" \
+            "Sources/TokenUse/Localization/Sparkle.strings"
+        plutil -convert binary1 -o "$SPARKLE_RES/zh-Hans.lproj/Sparkle.strings" \
+            "Sources/TokenUse/Localization/Sparkle.strings"
+        echo "==> Localized Sparkle.framework UI strings (zh_CN & zh-Hans)"
+    fi
     echo "==> Sparkle framework embedded (arm64-only)"
 else
     echo "ERROR: Sparkle.framework not found in .build/. Did swift build succeed?"
     exit 1
+fi
+
+if [ -f "Sources/TokenUse/Localization/InfoPlist.strings" ]; then
+    for loc in zh-Hans zh_CN; do
+        mkdir -p "$APP_BUNDLE/Contents/Resources/${loc}.lproj"
+        plutil -convert binary1 -o "$APP_BUNDLE/Contents/Resources/${loc}.lproj/InfoPlist.strings" \
+            "Sources/TokenUse/Localization/InfoPlist.strings"
+    done
+    echo "==> Installed Chinese bundle localizations (zh-Hans & zh_CN)"
 fi
 
 if [ -f "Sources/TokenUse/Resources/AppIcon.icns" ]; then

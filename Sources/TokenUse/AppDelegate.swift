@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.messageText = "暂时无法检查更新"
             alert.informativeText = "当前应用包未配置 Sparkle 发布公钥（SUPublicEDKey）。请在正式发布包中写入公钥后再启用自动更新。"
             alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "好")
             alert.runModal()
             return
         }

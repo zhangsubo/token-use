@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "TokenUse",
+    defaultLocalization: "zh-Hans",
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "TokenUse", targets: ["TokenUse"])
@@ -23,9 +24,9 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "SQLite", package: "SQLite.swift")
             ],
-            // Info.plist 模板由 build.sh 读取后写入 .app/Contents/Info.plist，
-            // 不应被 SwiftPM 当作 resource bundle 到产物里
-            exclude: ["Info.plist"],
+            // Info.plist 与 Localization 模板由 build.sh 写入 .app/Contents 与 Sparkle.framework，
+            // 不应被 SwiftPM 当作普通 resource 打包到子 bundle 里
+            exclude: ["Info.plist", "Localization"],
             resources: [
                 .process("Resources")
             ]
