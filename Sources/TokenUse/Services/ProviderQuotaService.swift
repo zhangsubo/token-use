@@ -10,6 +10,7 @@ struct ProviderQuotaResult: Sendable {
     var windows: [QuotaWindow] = []
     var walletBalanceText: String? = nil
     var resetCreditsText: String? = nil
+    var resetCredits: [ResetCreditItem] = []
     var cloudBilling: CloudBillingSummary? = nil
     var statusMessage: String?
     var errorMessage: String?
@@ -268,12 +269,59 @@ actor ProviderQuotaService {
             }
 
             var resetCouponText: String? = nil
+            var parsedResetCredits: [ResetCreditItem] = []
             if let rcPair = rawResetCredits,
                (200..<300).contains(rcPair.status),
                let rcJSON = try? JSONSerialization.jsonObject(with: rcPair.data) as? [String: Any] {
+                let now = Date()
+                if let rawCredits = rcJSON["credits"] as? [[String: Any]] {
+                    for (idx, item) in rawCredits.enumerated() {
+                        let status = (item["status"] as? String)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .lowercased() ?? ""
+                        guard status == "available" else { continue }
+                        if let supported = item["is_supported_by_plan"] as? Bool, !supported {
+                            continue
+                        }
+                        if let redeemedStr = item["redeemed_at"] as? String,
+                           !redeemedStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            continue
+                        }
+                        let expiresAt: Date? = {
+                            if let expStr = item["expires_at"] as? String {
+                                return FastDateParser.parseISO8601(expStr)
+                            }
+                            let expNum = doubleValue(item["expires_at"])
+                            return expNum > 1_000_000_000 ? Date(timeIntervalSince1970: expNum) : nil
+                        }()
+                        guard let expiresAt, expiresAt > now else { continue }
+
+                        let grantedAt: Date? = {
+                            if let gStr = item["granted_at"] as? String {
+                                return FastDateParser.parseISO8601(gStr)
+                            }
+                            let gNum = doubleValue(item["granted_at"])
+                            return gNum > 1_000_000_000 ? Date(timeIntervalSince1970: gNum) : nil
+                        }()
+                        let rawId = (item["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        let creditId = rawId.isEmpty
+                            ? "\(account.id)-\(Int(expiresAt.timeIntervalSince1970))-\(idx)"
+                            : rawId
+                        let title = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        parsedResetCredits.append(ResetCreditItem(
+                            id: creditId,
+                            expiresAt: expiresAt,
+                            grantedAt: grantedAt,
+                            title: (title?.isEmpty == false) ? title : nil
+                        ))
+                    }
+                    parsedResetCredits.sort { $0.expiresAt < $1.expiresAt }
+                }
+
                 let avail = intValue(rcJSON["available_count"])
-                if avail > 0 {
-                    resetCouponText = "重置券 ×\(avail)"
+                let effectiveCount = avail > 0 ? avail : parsedResetCredits.count
+                if effectiveCount > 0 {
+                    resetCouponText = "重置券 ×\(effectiveCount)"
                 }
             }
 
@@ -286,6 +334,7 @@ actor ProviderQuotaService {
                 windows: windows,
                 walletBalanceText: walletText,
                 resetCreditsText: resetCouponText,
+                resetCredits: parsedResetCredits,
                 cloudBilling: cloudBilling,
                 statusMessage: windows.isEmpty ? "当前套餐暂无滚动速率限制" : nil
             )

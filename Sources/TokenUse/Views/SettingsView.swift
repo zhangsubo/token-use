@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case accounts = "多账号管理"
@@ -16,6 +17,7 @@ struct SettingsView: View {
 
     @ObservedObject private var settings = SettingsManager.shared
     @ObservedObject private var appState = AppState.shared
+    @ObservedObject private var resetNotifyService = ResetCreditNotificationService.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var selectedTab: SettingsTab = .accounts
@@ -29,6 +31,9 @@ struct SettingsView: View {
     @State private var isCustomInterval: Bool = false
     @State private var previewImage: NSImage?
     @State private var isImportingMascot = false
+    @State private var isSendingTestNotification = false
+    @State private var testNotifyFeedback: String? = nil
+    @State private var testNotifyIsError = false
 
     private let intervalOptions: [(String, TimeInterval)] = [
         ("5 分钟", 300),
@@ -95,6 +100,9 @@ struct SettingsView: View {
             selectedTab = initialTab
             setupIntervalState()
             appState.reloadAccountList()
+            Task {
+                _ = await resetNotifyService.refreshAuthorizationStatus()
+            }
             if let provider = initialAddingProvider {
                 editingAccount = .newManual(provider: provider)
             }
@@ -530,6 +538,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 24) {
                 sidebarPositionSection
                 displaySection
+                notificationSection
                 providerOrderSection
                 refreshSection
                 mascotSection
@@ -713,6 +722,105 @@ struct SettingsView: View {
                 Text("关闭后将隐藏今日、近 90 天及各平台分组上的等效美元价值估算标签。")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.white.opacity(0.5))
+            }
+        }
+    }
+
+    private var notificationSection: some View {
+        let authStatus = resetNotifyService.authorizationStatus
+        let statusInfo: (text: String, color: Color) = {
+            if !ResetCreditNotificationService.isSupportedBundle {
+                return ("仅 .app 模式可用", .orange)
+            }
+            switch authStatus {
+            case .authorized, .provisional, .ephemeral:
+                return ("系统通知已开启", Color(.sRGB, red: 0.42, green: 0.94, blue: 0.68))
+            case .denied:
+                return ("系统通知权限已关闭", .orange)
+            case .notDetermined:
+                return ("待授权通知权限", Color.cyan)
+            @unknown default:
+                return ("未知状态", .gray)
+            }
+        }()
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("到期提醒与通知")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+
+                Text(statusInfo.text)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(statusInfo.color)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(statusInfo.color.opacity(0.16))
+                            .overlay(Capsule().stroke(statusInfo.color.opacity(0.38), lineWidth: 0.6))
+                    )
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("ChatGPT 重置券到期通知（剩余完整 48 小时提醒）", isOn: $settings.enableResetCreditExpiryNotification)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(.white.opacity(0.9))
+
+                Text("当已启用的 ChatGPT / Codex 账号中存在距离到期不足两天（完整 48 小时）的重置券时，自动发送 macOS 系统通知提醒当前账号与用量百分比。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    isSendingTestNotification = true
+                    testNotifyFeedback = nil
+                    Task {
+                        let result = await resetNotifyService.sendTestNotification(dashboard: appState.dashboard)
+                        isSendingTestNotification = false
+                        switch result {
+                        case .success(let previewBody):
+                            testNotifyIsError = false
+                            testNotifyFeedback = "已发送：\(previewBody)"
+                        case .failure(let error):
+                            testNotifyIsError = true
+                            testNotifyFeedback = error.localizedDescription
+                        }
+                    }
+                } label: {
+                    Label("发送测试通知", systemImage: "bell.badge")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isSendingTestNotification)
+
+                if authStatus == .denied {
+                    Button {
+                        resetNotifyService.openSystemNotificationSettings()
+                    } label: {
+                        Label("前往系统通知设置", systemImage: "gearshape")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            if let feedback = testNotifyFeedback, !feedback.isEmpty {
+                Text(feedback)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(
+                        testNotifyIsError
+                            ? Color.orange.opacity(0.92)
+                            : Color(.sRGB, red: 0.42, green: 0.94, blue: 0.68).opacity(0.92)
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

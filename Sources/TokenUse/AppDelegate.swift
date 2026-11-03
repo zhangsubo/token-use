@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         EdgeWindowManager.shared.setup()
         DebugLogger.log("✅ EdgeWindowManager.setup() 完成")
 
+        ResetCreditNotificationService.shared.setup()
+        DebugLogger.log("✅ ResetCreditNotificationService.setup() 完成")
+
         if SettingsManager.shared.enableAutoUpdate, Self.isSparkleConfigured {
             updaterController = SPUStandardUpdaterController(
                 startingUpdater: true,

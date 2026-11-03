@@ -18,6 +18,8 @@ final class SettingsManager: ObservableObject {
         static let enableAutoDiscovery = "enableAutoDiscovery"
         static let showEstimatedCost = "showEstimatedCost"
         static let maskAccountLabels = "maskAccountLabels"
+        static let enableResetCreditExpiryNotification = "enableResetCreditExpiryNotification"
+        static let notifiedResetCreditIDs = "notifiedResetCreditIDs"
         static let providerOrder = "providerOrder"
         static let dockEdge = "dockEdge"
         static let dockVerticalRatio = "dockVerticalRatio"
@@ -63,8 +65,26 @@ final class SettingsManager: ObservableObject {
 
     /// 是否对界面展示的账号名称/邮箱进行脱敏打码（默认 `true` 开启）
     @Published var maskAccountLabels: Bool {
-        didSet { defaults.set(maskAccountLabels, forKey: Keys.maskAccountLabels) }
+        didSet {
+            defaults.set(maskAccountLabels, forKey: Keys.maskAccountLabels)
+            Task { @MainActor in
+                await ResetCreditNotificationService.shared.evaluate(dashboard: AppState.shared.dashboard)
+            }
+        }
     }
+
+    /// 当 ChatGPT 重置券距离到期不足 48 小时（完整两天）时发送 macOS 系统通知（默认 `true` 开启）
+    @Published var enableResetCreditExpiryNotification: Bool {
+        didSet {
+            defaults.set(enableResetCreditExpiryNotification, forKey: Keys.enableResetCreditExpiryNotification)
+            Task { @MainActor in
+                await ResetCreditNotificationService.shared.evaluate(dashboard: AppState.shared.dashboard)
+            }
+        }
+    }
+
+    /// 记录已触发过 48 小时到期提醒的重置券唯一 ID 列表（保序有界去重，防止重复打扰）
+    private var notifiedResetCreditIDList: [String] = []
 
     @Published var providerOrder: [TrackedProvider] {
         didSet {
@@ -144,6 +164,13 @@ final class SettingsManager: ObservableObject {
         } else {
             self.maskAccountLabels = defaults.bool(forKey: Keys.maskAccountLabels)
         }
+
+        if defaults.object(forKey: Keys.enableResetCreditExpiryNotification) == nil {
+            self.enableResetCreditExpiryNotification = true
+        } else {
+            self.enableResetCreditExpiryNotification = defaults.bool(forKey: Keys.enableResetCreditExpiryNotification)
+        }
+        self.notifiedResetCreditIDList = defaults.stringArray(forKey: Keys.notifiedResetCreditIDs) ?? []
 
         self.providerOrder = Self.normalizedProviderOrder(from: defaults.stringArray(forKey: Keys.providerOrder))
 
@@ -462,5 +489,26 @@ final class SettingsManager: ObservableObject {
         cachedCustomMascotPath = path
         cachedCustomMascotImage = image
         return image
+    }
+
+    // MARK: - Reset Credit Notification Deduplication
+
+    func hasNotifiedResetCredit(_ creditID: String) -> Bool {
+        notifiedResetCreditIDList.contains(creditID)
+    }
+
+    func markResetCreditsNotified(_ creditIDs: [String]) {
+        var changed = false
+        for id in creditIDs where !id.isEmpty {
+            if !notifiedResetCreditIDList.contains(id) {
+                notifiedResetCreditIDList.append(id)
+                changed = true
+            }
+        }
+        guard changed else { return }
+        if notifiedResetCreditIDList.count > 250 {
+            notifiedResetCreditIDList.removeFirst(notifiedResetCreditIDList.count - 250)
+        }
+        defaults.set(notifiedResetCreditIDList, forKey: Keys.notifiedResetCreditIDs)
     }
 }

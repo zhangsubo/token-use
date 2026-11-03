@@ -953,13 +953,38 @@ private struct AccountQuotaCard: View {
                 }
 
                 if let credits = account.resetCreditsText, !credits.isEmpty {
-                    Text(credits)
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.68))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background(Capsule().fill(.white.opacity(0.07)))
-                        .lineLimit(1)
+                    let expiringSoon = account.hasExpiringSoonResetCredit()
+                    HStack(spacing: 3) {
+                        if expiringSoon {
+                            Image(systemName: "clock.badge.exclamationmark")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        Text(credits)
+                            .font(.system(size: 10, weight: expiringSoon ? .semibold : .medium, design: .rounded))
+                    }
+                    .foregroundStyle(
+                        expiringSoon
+                            ? Color(.sRGB, red: 1.0, green: 0.78, blue: 0.34)
+                            : .white.opacity(0.68)
+                    )
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1.5)
+                    .background(
+                        Capsule()
+                            .fill(
+                                expiringSoon
+                                    ? Color.orange.opacity(0.20)
+                                    : .white.opacity(0.07)
+                            )
+                            .overlay(
+                                Capsule().stroke(
+                                    expiringSoon ? Color.orange.opacity(0.50) : .clear,
+                                    lineWidth: 0.6
+                                )
+                            )
+                    )
+                    .lineLimit(1)
+                    .help(Self.resetCreditsTooltip(for: account))
                 }
 
                 Spacer(minLength: 4)
@@ -1080,6 +1105,34 @@ private struct AccountQuotaCard: View {
                         )
                 )
         )
+    }
+
+    private static func resetCreditsTooltip(for account: AccountUsageSnapshot) -> String {
+        let now = Date()
+        let items = account.activeResetCredits(at: now)
+        guard !items.isEmpty else {
+            return "ChatGPT 速率限制重置券（剩余不足 48 小时时自动发送 macOS 系统通知提醒）"
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+
+        var lines: [String] = ["可用 ChatGPT 重置券（共 \(items.count) 张）："]
+        for (idx, item) in items.enumerated() {
+            let secs = max(0, Int(item.expiresAt.timeIntervalSince(now)))
+            let days = secs / 86_400
+            let hours = (secs % 86_400) / 3_600
+            let mins = (secs % 3_600) / 60
+            let remainText: String
+            if days > 0 {
+                remainText = "剩余 \(days)天\(hours)小时"
+            } else if hours > 0 {
+                remainText = "剩余 \(hours)小时\(mins)分（≤48h 即将到期）"
+            } else {
+                remainText = "剩余 \(max(1, mins))分钟（即将到期）"
+            }
+            lines.append("• 第 \(idx + 1) 张：\(remainText) · 到期 \(formatter.string(from: item.expiresAt))")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func cloudBillingStrip(_ cb: CloudBillingSummary) -> some View {

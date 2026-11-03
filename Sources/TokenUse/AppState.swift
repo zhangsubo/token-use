@@ -139,6 +139,7 @@ final class AppState: ObservableObject {
             updatedAt: now
         )
         try? await reportManager.saveSnapshot(builtDashboard, filename: dashboardCacheFilename)
+        await ResetCreditNotificationService.shared.evaluate(dashboard: builtDashboard)
     }
 
     /// 一键切换本机 `$CODEX_HOME/auth.json` 当前活跃的 Codex OAuth 账号
@@ -246,6 +247,8 @@ final class AppState: ObservableObject {
         statusMessage = "更新于 \(timeStr)"
         isLoading = false
         DebugLogger.log("✅ [AppState] 同步完成: \(builtDashboard.totalActiveAccounts) 个活跃账号")
+
+        await ResetCreditNotificationService.shared.evaluate(dashboard: builtDashboard)
     }
 
     private func resolveSpeed(
@@ -379,6 +382,10 @@ final class AppState: ObservableObject {
                     if snapshots[existingIdx].resetCreditsText == nil {
                         snapshots[existingIdx].resetCreditsText = q?.resetCreditsText
                     }
+                    if (snapshots[existingIdx].resetCredits ?? []).isEmpty,
+                       let credits = q?.resetCredits, !credits.isEmpty {
+                        snapshots[existingIdx].resetCredits = credits
+                    }
                     continue
                 }
 
@@ -402,6 +409,7 @@ final class AppState: ObservableObject {
                     canSwitchSystemAccount: canSwitchSystem,
                     walletBalanceText: q?.walletBalanceText,
                     resetCreditsText: q?.resetCreditsText,
+                    resetCredits: (q?.resetCredits.isEmpty == false) ? q?.resetCredits : nil,
                     todayTokens: effectiveAcctToday,
                     localTodayTokens: rawLocalToday,
                     todayCost: acctToday.cost,

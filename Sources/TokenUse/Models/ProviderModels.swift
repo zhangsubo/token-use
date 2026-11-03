@@ -279,6 +279,12 @@ struct QuotaWindow: Codable, Sendable, Identifiable, Equatable {
         if let resetAt, resetAt <= now { return 100.0 }
         return remainingPercent
     }
+
+    func effectiveUsedPercent(at now: Date = Date()) -> Double {
+        if isUnlimited { return 0.0 }
+        if let resetAt, resetAt <= now { return 0.0 }
+        return usedPercent
+    }
 }
 
 struct TokenBreakdownSnapshot: Codable, Sendable, Equatable {
@@ -391,6 +397,14 @@ struct CloudBillingSummary: Codable, Sendable, Equatable {
     }
 }
 
+/// ChatGPT / Codex 可用重置券单张条目（含唯一 ID 与精确过期时间）
+struct ResetCreditItem: Codable, Sendable, Identifiable, Equatable {
+    var id: String
+    var expiresAt: Date
+    var grantedAt: Date? = nil
+    var title: String? = nil
+}
+
 struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var id: String
     var provider: TrackedProvider
@@ -405,6 +419,7 @@ struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
     var canSwitchSystemAccount: Bool = false
     var walletBalanceText: String? = nil
     var resetCreditsText: String? = nil
+    var resetCredits: [ResetCreditItem]? = nil
     var todayTokens: Int
     var localTodayTokens: Int? = nil
     var todayCost: Double
@@ -421,6 +436,34 @@ struct AccountUsageSnapshot: Codable, Sendable, Identifiable, Equatable {
 
     var resolvedModelUsages: [ModelUsageItem] {
         modelUsages ?? cloudBilling?.models ?? []
+    }
+
+    /// 提取当前 ChatGPT / Codex 主限额池（优先 7d 周限额，其次首个主窗口）的已用百分比（0...100 整数）
+    func codexPrimaryUsedPercent(at now: Date = Date()) -> Int {
+        let coreWindows = quotaWindows.filter {
+            !$0.id.hasPrefix("codex.cr.") && !$0.id.hasPrefix("codex.add.")
+        }
+        let source = coreWindows.isEmpty ? quotaWindows : coreWindows
+        let target = source.first(where: { $0.label.contains("7d") || $0.label.contains("周") })
+            ?? source.first
+        let raw = target?.effectiveUsedPercent(at: now) ?? 0.0
+        return min(100, max(0, Int(raw.rounded())))
+    }
+
+    func activeResetCredits(at now: Date = Date()) -> [ResetCreditItem] {
+        (resetCredits ?? [])
+            .filter { $0.expiresAt > now }
+            .sorted { $0.expiresAt < $1.expiresAt }
+    }
+
+    func hasExpiringSoonResetCredit(
+        within threshold: TimeInterval = 48 * 3600,
+        at now: Date = Date()
+    ) -> Bool {
+        activeResetCredits(at: now).contains {
+            let remaining = $0.expiresAt.timeIntervalSince(now)
+            return remaining > 0 && remaining <= threshold
+        }
     }
 }
 
