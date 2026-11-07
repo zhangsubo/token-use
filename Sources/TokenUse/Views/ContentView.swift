@@ -291,19 +291,23 @@ struct TokenDashboardContent: View {
                     openSettings(tab: .accounts, adding: nil)
                 }
 
-                HeaderActionButton(systemName: "xmark", help: "退出 TokenUse", role: .close) {
-                    NSApp.terminate(nil)
+                HeaderActionButton(
+                    systemName: settings.dockEdge == .left ? "arrow.left.to.line" : "arrow.right.to.line",
+                    help: edgeManager.isPinned ? "取消固定并收回面板" : "收回面板"
+                ) {
+                    edgeManager.collapsePanel()
                 }
             }
         }
     }
 
     private var headerSubtitle: String {
+        let count = TrackedProvider.allCases.count
         if appState.isLoading {
-            return "正在同步 5 大平台本地日志与实时配额..."
+            return "正在同步 \(count) 大平台本地日志与实时配额..."
         }
         if let dashboard = appState.dashboard {
-            return "5 大平台 · \(dashboard.totalActiveAccounts) 个已启用账号"
+            return "\(count) 大平台 · \(dashboard.totalActiveAccounts) 个已启用账号"
         }
         return appState.statusMessage
     }
@@ -347,37 +351,37 @@ struct TokenDashboardContent: View {
     }
 
     private func providerFilterBar(dashboard: MultiAccountDashboard) -> some View {
-        HStack(spacing: 6) {
-            FilterChipButton(
-                title: "全部",
-                icon: "square.grid.2x2.fill",
-                provider: nil,
-                badgeCount: dashboard.totalActiveAccounts,
-                accent: .white,
-                isSelected: selectedProvider == nil
-            ) {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    selectedProvider = nil
-                }
-            }
-
-            ForEach(settings.providerOrder) { provider in
-                let count = dashboard.providers.first(where: { $0.provider == provider })?.accounts.count ?? 0
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
                 FilterChipButton(
-                    title: provider.shortName,
-                    icon: provider.systemIcon,
-                    provider: provider,
-                    badgeCount: count,
-                    accent: provider.accentColor,
-                    isSelected: selectedProvider == provider
+                    title: "全部",
+                    icon: "square.grid.2x2.fill",
+                    provider: nil,
+                    badgeCount: dashboard.totalActiveAccounts,
+                    accent: .white,
+                    isSelected: selectedProvider == nil
                 ) {
                     withAnimation(.easeInOut(duration: 0.15)) {
-                        selectedProvider = (selectedProvider == provider) ? nil : provider
+                        selectedProvider = nil
+                    }
+                }
+
+                ForEach(settings.providerOrder) { provider in
+                    let count = dashboard.providers.first(where: { $0.provider == provider })?.accounts.count ?? 0
+                    FilterChipButton(
+                        title: provider.shortName,
+                        icon: provider.systemIcon,
+                        provider: provider,
+                        badgeCount: count,
+                        accent: provider.accentColor,
+                        isSelected: selectedProvider == provider
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectedProvider = (selectedProvider == provider) ? nil : provider
+                        }
                     }
                 }
             }
-
-            Spacer(minLength: 0)
         }
     }
 
@@ -551,6 +555,7 @@ private struct FilterChipButton: View {
                 Text(title)
                     .font(.system(size: 11.5, weight: isSelected ? .semibold : .medium))
                     .foregroundStyle(isSelected ? .white : .white.opacity(0.72))
+                    .lineLimit(1)
 
                 if badgeCount > 0 {
                     Text("\(badgeCount)")
@@ -562,8 +567,10 @@ private struct FilterChipButton: View {
                             Capsule()
                                 .fill(isSelected ? accent.opacity(0.35) : .white.opacity(0.10))
                         )
+                        .lineLimit(1)
                 }
             }
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(

@@ -153,6 +153,8 @@ actor ProviderQuotaService {
                 ephemeralSecrets: ephemeralSecrets,
                 liveStatuses: liveAntigravity
             )
+        case .opencodeGo:
+            return await fetchOpenCodeGoQuota(account: account, ephemeralSecrets: ephemeralSecrets)
         }
     }
 
@@ -3434,7 +3436,7 @@ actor ProviderQuotaService {
                 }
             }
 
-            if let fallbackLive = matchedLive ?? (account.externalAccountId == nil ? liveStatuses.first : nil) {
+            if let fallbackLive = matchedLive {
                 return ProviderQuotaResult(
                     resolvedLabel: fallbackLive.email ?? fallbackLive.displayName,
                     resolvedExternalId: fallbackLive.email,
@@ -3445,7 +3447,7 @@ actor ProviderQuotaService {
             }
             return ProviderQuotaResult(errorMessage: "无法从 Cloud Code 获取 Antigravity 模型配额")
         } catch {
-            if let fallbackLive = matchedLive ?? (account.externalAccountId == nil ? liveStatuses.first : nil) {
+            if let fallbackLive = matchedLive {
                 return ProviderQuotaResult(
                     resolvedLabel: fallbackLive.email ?? fallbackLive.displayName,
                     resolvedExternalId: fallbackLive.email,
@@ -4178,6 +4180,7 @@ actor ProviderQuotaService {
             "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
             "/Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
             "\(home)/.gemini/antigravity-cli/bin/agy",
+            "\(home)/.local/bin/agy",
         ]
 
         let prefix = Array("GOCSPX-".utf8)
@@ -4202,8 +4205,9 @@ actor ProviderQuotaService {
                        base[i + 4] == prefix[4],
                        base[i + 5] == prefix[5],
                        base[i + 6] == prefix[6] {
+                        // Go .rodata 字符串连续存储无 '\0' 分隔，Google GOCSPX- 密钥固定为 35 字节（7 + 28）
                         var end = i + 7
-                        while end < min(count, i + 48) {
+                        while end < min(count, i + 35) {
                             let b = base[end]
                             let isAllowed = (b >= 48 && b <= 57) || (b >= 65 && b <= 90)
                                 || (b >= 97 && b <= 122) || b == 45 || b == 95
@@ -4211,7 +4215,7 @@ actor ProviderQuotaService {
                             end += 1
                         }
                         let len = end - i
-                        if len >= 28 && len <= 42 {
+                        if len >= 28 && len <= 35 {
                             let slice = Data(bytes: base + i, count: len)
                             if let str = String(data: slice, encoding: .utf8), seen.insert(str).inserted {
                                 found.append(str)
@@ -4351,6 +4355,669 @@ actor ProviderQuotaService {
         } catch {
             return nil
         }
+    }
+
+    // MARK: - 6. OpenCode Go
+
+    private static let openCodeWorkspaceIDPattern = #"^(?:org|wrk|wk)_[A-Za-z0-9]+$"#
+    private static let openCodeServerWorkspaceFnID = "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f"
+    private static let openCodeMicroCentsPerDollar = 100_000_000.0
+
+    private func fetchOpenCodeGoQuota(
+        account: ProviderAccountConfig,
+        ephemeralSecrets: [String: String]
+    ) async -> ProviderQuotaResult {
+        if account.authKind == .localOnly {
+            return ProviderQuotaResult(statusMessage: "仅本地会话日志模式")
+        }
+
+        let isSilentNonGo = (account.source == .autoDiscovered)
+            && (account.credentialLookupKey == "opencode.shared" || account.credentialLookupKey == "opencode.console")
+
+        guard let rawSecret = (KeychainStore.loadSecret(for: account.id) ?? ephemeralSecrets[account.id])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawSecret.isEmpty else {
+            return ProviderQuotaResult(errorMessage: "未配置 OpenCode Go 凭证")
+        }
+
+        if account.authKind == .cookie
+            || rawSecret.contains("__Host-console_session=")
+            || rawSecret.contains("auth=")
+            || rawSecret.contains("__Host-auth=") {
+            return await fetchOpenCodeGoViaCookie(
+                account: account,
+                rawCookie: rawSecret,
+                isSilentNonGo: isSilentNonGo
+            )
+        }
+
+        if rawSecret.hasPrefix("{"),
+           let data = rawSecret.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let credType = (dict["type"] as? String)?.lowercased() ?? ""
+            if credType == "oauth" || dict["access"] != nil || dict["access_token"] != nil {
+                return await fetchOpenCodeGoViaOAuth(
+                    account: account,
+                    oauthDict: dict,
+                    isSilentNonGo: isSilentNonGo
+                )
+            }
+            if let key = (dict["key"] as? String) ?? (dict["apiKey"] as? String) ?? (dict["token"] as? String),
+               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return await fetchOpenCodeGoViaAPIKey(
+                    account: account,
+                    apiKey: key.trimmingCharacters(in: .whitespacesAndNewlines),
+                    isSilentNonGo: isSilentNonGo
+                )
+            }
+        }
+
+        if account.authKind == .oauthToken,
+           let extId = account.externalAccountId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           Self.isValidOpenCodeWorkspaceID(extId) {
+            return await fetchOpenCodeGoViaOAuth(
+                account: account,
+                oauthDict: ["access": rawSecret, "orgID": extId],
+                isSilentNonGo: isSilentNonGo
+            )
+        }
+
+        return await fetchOpenCodeGoViaAPIKey(
+            account: account,
+            apiKey: rawSecret,
+            isSilentNonGo: isSilentNonGo
+        )
+    }
+
+    private func openCodeNonGoResult(_ message: String, isSilentNonGo: Bool) -> ProviderQuotaResult {
+        isSilentNonGo
+            ? ProviderQuotaResult(statusMessage: message)
+            : ProviderQuotaResult(errorMessage: message)
+    }
+
+    private static func isValidOpenCodeWorkspaceID(_ raw: String?) -> Bool {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return false
+        }
+        return raw.range(of: openCodeWorkspaceIDPattern, options: .regularExpression) != nil
+    }
+
+    private static func extractOpenCodeWorkspaceID(from text: String?) -> String? {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return nil
+        }
+        if isValidOpenCodeWorkspaceID(text) {
+            return text
+        }
+        if let range = text.range(of: #"(?:org|wrk|wk)_[A-Za-z0-9]+"#, options: .regularExpression) {
+            return String(text[range])
+        }
+        return nil
+    }
+
+    private static func normalizedOpenCodeOrigin(customBase: String?) -> String {
+        guard let raw = customBase?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              raw.lowercased().hasPrefix("http"),
+              let comps = URLComponents(string: raw),
+              let scheme = comps.scheme,
+              let host = comps.host else {
+            return "https://opencode.ai"
+        }
+        if let port = comps.port {
+            return "\(scheme)://\(host):\(port)"
+        }
+        return "\(scheme)://\(host)"
+    }
+
+    private static func normalizedOpenCodeConsoleAPIBase(customBase: String?, serverHint: String? = nil) -> String {
+        for candidate in [customBase, serverHint] {
+            guard let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty,
+                  raw.lowercased().hasPrefix("http") else { continue }
+            var trimmed = raw
+            while trimmed.hasSuffix("/") { trimmed.removeLast() }
+            if trimmed.hasSuffix("/console/api") {
+                return trimmed
+            }
+            if trimmed.hasSuffix("/console") {
+                return "\(trimmed)/api"
+            }
+            let origin = normalizedOpenCodeOrigin(customBase: trimmed)
+            return "\(origin)/console/api"
+        }
+        return "https://opencode.ai/console/api"
+    }
+
+    private func fetchOpenCodeGoViaOAuth(
+        account: ProviderAccountConfig,
+        oauthDict: [String: Any],
+        isSilentNonGo: Bool
+    ) async -> ProviderQuotaResult {
+        let access = ((oauthDict["access"] as? String) ?? (oauthDict["access_token"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !access.isEmpty else {
+            return openCodeNonGoResult("OpenCode OAuth 缺少访问令牌", isSilentNonGo: isSilentNonGo)
+        }
+
+        let metadata = oauthDict["metadata"] as? [String: Any]
+        let orgID = Self.extractOpenCodeWorkspaceID(from: account.externalAccountId)
+            ?? Self.extractOpenCodeWorkspaceID(from: metadata?["orgID"] as? String)
+            ?? Self.extractOpenCodeWorkspaceID(from: oauthDict["orgID"] as? String)
+            ?? Self.extractOpenCodeWorkspaceID(from: oauthDict["accountId"] as? String)
+            ?? Self.extractOpenCodeWorkspaceID(from: account.regionOrBaseURL)
+
+        guard let orgID, Self.isValidOpenCodeWorkspaceID(orgID) else {
+            return openCodeNonGoResult("OpenCode OAuth 缺少工作区 ID (org_/wrk_)", isSilentNonGo: isSilentNonGo)
+        }
+
+        let consoleAPIBase = Self.normalizedOpenCodeConsoleAPIBase(
+            customBase: account.regionOrBaseURL,
+            serverHint: (metadata?["server"] as? String) ?? (oauthDict["server"] as? String)
+        )
+        guard let statusURL = URL(string: "\(consoleAPIBase)/go/status") else {
+            return ProviderQuotaResult(errorMessage: "OpenCode Console 地址格式无效")
+        }
+
+        var req = URLRequest(url: statusURL)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+        req.setValue(orgID, forHTTPHeaderField: "x-org-id")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+        async let billingBalanceTask = fetchOpenCodeConsoleBillingBalance(
+            consoleAPIBase: consoleAPIBase,
+            bearerToken: access,
+            cookieHeader: nil,
+            orgID: orgID
+        )
+
+        do {
+            let (data, response) = try await noRedirectSession.data(for: req)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let walletBalance = await billingBalanceTask
+
+            if status == 401 || (300..<400).contains(status) {
+                return openCodeNonGoResult("OpenCode 登录已失效，请重新执行 opencode auth login", isSilentNonGo: isSilentNonGo)
+            }
+            if status == 403 {
+                return openCodeNonGoResult("当前 OpenCode 工作区未开通 Go 订阅", isSilentNonGo: isSilentNonGo)
+            }
+            guard (200..<300).contains(status) else {
+                return ProviderQuotaResult(errorMessage: "OpenCode Console HTTP \(status)")
+            }
+
+            if let parsed = parseOpenCodeConsoleGoStatus(
+                data: data,
+                walletBalanceText: walletBalance,
+                resolvedExternalId: orgID
+            ) {
+                return parsed
+            }
+            return openCodeNonGoResult("当前 OpenCode 账号未开通 Go 订阅", isSilentNonGo: isSilentNonGo)
+        } catch {
+            return ProviderQuotaResult(errorMessage: "连接失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func fetchOpenCodeGoViaAPIKey(
+        account: ProviderAccountConfig,
+        apiKey rawKey: String,
+        isSilentNonGo: Bool
+    ) async -> ProviderQuotaResult {
+        var apiKey = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey.lowercased().hasPrefix("bearer ") {
+            apiKey = String(apiKey.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !apiKey.isEmpty else {
+            return ProviderQuotaResult(errorMessage: "未配置 OpenCode Go API Key")
+        }
+
+        let customBase = account.regionOrBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explicitOrgID = Self.extractOpenCodeWorkspaceID(from: account.externalAccountId)
+            ?? Self.extractOpenCodeWorkspaceID(from: customBase)
+        let origin = Self.normalizedOpenCodeOrigin(customBase: customBase)
+        let isCustomNonOfficialHost: Bool = {
+            guard let customBase, !customBase.isEmpty, customBase.lowercased().hasPrefix("http") else {
+                return false
+            }
+            return !origin.lowercased().contains("opencode.ai")
+        }()
+
+        // 1) 官方域名优先尝试 /console/api/go/status：返回精确浮点微美分 ($used / $limit) 与 Go/Go Plus/Go Teams 等级
+        if !isCustomNonOfficialHost {
+            let consoleAPIBase = Self.normalizedOpenCodeConsoleAPIBase(customBase: customBase)
+            if let consoleURL = URL(string: "\(consoleAPIBase)/go/status") {
+                var consoleReq = URLRequest(url: consoleURL)
+                consoleReq.httpMethod = "GET"
+                consoleReq.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                if let explicitOrgID {
+                    consoleReq.setValue(explicitOrgID, forHTTPHeaderField: "x-org-id")
+                }
+                consoleReq.setValue("application/json", forHTTPHeaderField: "Accept")
+                consoleReq.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+                if let (cData, cResp) = try? await noRedirectSession.data(for: consoleReq),
+                   let http = cResp as? HTTPURLResponse,
+                   (200..<300).contains(http.statusCode),
+                   let richResult = parseOpenCodeConsoleGoStatus(
+                       data: cData,
+                       walletBalanceText: nil,
+                       resolvedExternalId: explicitOrgID
+                   ) {
+                    return richResult
+                }
+            }
+        }
+
+        // 2) 标准公开配额接口 /zen/go/v1/usage（兼容自定义网关与官方 API Key 端点）
+        let usageURLString: String = {
+            if let customBase, !customBase.isEmpty, customBase.lowercased().hasPrefix("http") {
+                var clean = customBase
+                while clean.hasSuffix("/") { clean.removeLast() }
+                let lower = clean.lowercased()
+                if lower.hasSuffix("/usage") {
+                    return clean
+                }
+                if lower.hasSuffix("/zen/go/v1") || lower.hasSuffix("/go/v1") {
+                    return "\(clean)/usage"
+                }
+            }
+            return "\(origin)/zen/go/v1/usage"
+        }()
+
+        guard let usageURL = URL(string: usageURLString) else {
+            return ProviderQuotaResult(errorMessage: "OpenCode Go 接口地址格式无效")
+        }
+
+        var request = URLRequest(url: usageURL)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("tokenuse-usage", forHTTPHeaderField: "x-opencode-session")
+        request.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await noRedirectSession.data(for: request)
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
+            let contentType = (http?.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let errObj = json?["error"] as? [String: Any]
+            let errCode = (errObj?["code"] as? String)?.lowercased()
+            let errType = (errObj?["type"] as? String) ?? ""
+            let errMsg = (errObj?["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if status == 401 || (300..<400).contains(status) || errType == "AuthError" {
+                if errCode == "api_key_expired" {
+                    return openCodeNonGoResult("OpenCode Go API Key 已过期", isSilentNonGo: isSilentNonGo)
+                }
+                return openCodeNonGoResult(errMsg ?? "OpenCode Go API Key 无效或未授权", isSilentNonGo: isSilentNonGo)
+            }
+            if status == 403 || errType == "EntitlementError" {
+                return openCodeNonGoResult("当前工作区未开通 OpenCode Go 订阅", isSilentNonGo: isSilentNonGo)
+            }
+            guard (200..<300).contains(status) else {
+                return ProviderQuotaResult(errorMessage: errMsg ?? "HTTP \(status)")
+            }
+            if contentType.contains("text/html") && json == nil {
+                return openCodeNonGoResult("OpenCode Go 鉴权失败（返回登录页）", isSilentNonGo: isSilentNonGo)
+            }
+
+            if let parsed = parseOpenCodeZenGoUsage(json: json, resolvedExternalId: explicitOrgID) {
+                return parsed
+            }
+            return openCodeNonGoResult("未返回有效的 OpenCode Go 配额数据", isSilentNonGo: isSilentNonGo)
+        } catch {
+            return ProviderQuotaResult(errorMessage: "连接失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func fetchOpenCodeGoViaCookie(
+        account: ProviderAccountConfig,
+        rawCookie: String,
+        isSilentNonGo: Bool
+    ) async -> ProviderQuotaResult {
+        var cookieHeader = rawCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cookieHeader.lowercased().hasPrefix("cookie:") {
+            cookieHeader = String(cookieHeader.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if !cookieHeader.contains("=") {
+            cookieHeader = "auth=\(cookieHeader); __Host-auth=\(cookieHeader)"
+        }
+
+        let origin = Self.normalizedOpenCodeOrigin(customBase: account.regionOrBaseURL)
+        let consoleAPIBase = Self.normalizedOpenCodeConsoleAPIBase(customBase: account.regionOrBaseURL)
+
+        var workspaceIDs: [String] = []
+        if let ext = Self.extractOpenCodeWorkspaceID(from: account.externalAccountId) {
+            workspaceIDs.append(ext)
+        }
+        if let fromRegion = Self.extractOpenCodeWorkspaceID(from: account.regionOrBaseURL),
+           !workspaceIDs.contains(fromRegion) {
+            workspaceIDs.append(fromRegion)
+        }
+        if workspaceIDs.isEmpty {
+            let discovered = await discoverOpenCodeWorkspaceIDs(origin: origin, cookieHeader: cookieHeader)
+            workspaceIDs.append(contentsOf: discovered)
+        }
+
+        guard !workspaceIDs.isEmpty else {
+            return ProviderQuotaResult(errorMessage: "未能识别 OpenCode 工作区（Cookie 可能已失效，或请在配置中填写 wrk_/org_ 工作区 ID）")
+        }
+
+        var sawAuthFailure = false
+        for wsID in workspaceIDs {
+            guard let statusURL = URL(string: "\(consoleAPIBase)/go/status") else { continue }
+            var req = URLRequest(url: statusURL)
+            req.httpMethod = "GET"
+            req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+            req.setValue(wsID, forHTTPHeaderField: "x-org-id")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            req.setValue(origin, forHTTPHeaderField: "Origin")
+            req.setValue("\(origin)/console/\(wsID)/go", forHTTPHeaderField: "Referer")
+            req.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+            guard let (data, response) = try? await noRedirectSession.data(for: req),
+                  let http = response as? HTTPURLResponse else {
+                continue
+            }
+            if http.statusCode == 401 || (300..<400).contains(http.statusCode) {
+                sawAuthFailure = true
+                continue
+            }
+            guard (200..<300).contains(http.statusCode) else { continue }
+
+            let walletBalance = await fetchOpenCodeConsoleBillingBalance(
+                consoleAPIBase: consoleAPIBase,
+                bearerToken: nil,
+                cookieHeader: cookieHeader,
+                orgID: wsID
+            )
+            if let parsed = parseOpenCodeConsoleGoStatus(
+                data: data,
+                walletBalanceText: walletBalance,
+                resolvedExternalId: wsID
+            ) {
+                return parsed
+            }
+        }
+
+        if sawAuthFailure {
+            return ProviderQuotaResult(errorMessage: "OpenCode 网页 Cookie 已失效，请更新 Cookie")
+        }
+        return openCodeNonGoResult("所选工作区暂无活跃 OpenCode Go 订阅", isSilentNonGo: isSilentNonGo)
+    }
+
+    private func discoverOpenCodeWorkspaceIDs(origin: String, cookieHeader: String) async -> [String] {
+        guard let url = URL(string: "\(origin)/_server?id=\(Self.openCodeServerWorkspaceFnID)") else {
+            return []
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        req.setValue(Self.openCodeServerWorkspaceFnID, forHTTPHeaderField: "X-Server-Id")
+        req.setValue("server-fn:\(UUID().uuidString.lowercased())", forHTTPHeaderField: "X-Server-Instance")
+        req.setValue("text/javascript, application/json;q=0.9, */*;q=0.8", forHTTPHeaderField: "Accept")
+        req.setValue(origin, forHTTPHeaderField: "Origin")
+        req.setValue(origin, forHTTPHeaderField: "Referer")
+        req.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await noRedirectSession.data(for: req),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let text = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        guard let regex = try? NSRegularExpression(pattern: #"\bid\s*:\s*["']((?:org|wrk|wk)_[A-Za-z0-9]+)["']|["']id["']\s*:\s*["']((?:org|wrk|wk)_[A-Za-z0-9]+)["']"#) else {
+            return []
+        }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        var seen = Set<String>()
+        var ids: [String] = []
+        for match in regex.matches(in: text, range: nsRange) {
+            for groupIdx in [1, 2] {
+                let r = match.range(at: groupIdx)
+                if r.location != NSNotFound, let swiftRange = Range(r, in: text) {
+                    let id = String(text[swiftRange])
+                    if seen.insert(id).inserted {
+                        ids.append(id)
+                    }
+                }
+            }
+        }
+        return ids
+    }
+
+    private func fetchOpenCodeConsoleBillingBalance(
+        consoleAPIBase: String,
+        bearerToken: String?,
+        cookieHeader: String?,
+        orgID: String
+    ) async -> String? {
+        guard let url = URL(string: "\(consoleAPIBase)/billing/status") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if let bearerToken, !bearerToken.isEmpty {
+            req.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+        if let cookieHeader, !cookieHeader.isEmpty {
+            req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        }
+        req.setValue(orgID, forHTTPHeaderField: "x-org-id")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("TokenUse/1.3", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await noRedirectSession.data(for: req),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+
+        let microCents = optionalDoubleValue(json["availableMicroCents"])
+            ?? ((json["billingMode"] as? String)?.lowercased() == "prepaid"
+                ? optionalDoubleValue(json["balanceMicroCents"])
+                : nil)
+        guard let microCents, microCents.isFinite else { return nil }
+        let dollars = microCents / Self.openCodeMicroCentsPerDollar
+        guard dollars >= 0.005 else { return nil }
+        return String(format: "余额 $%.2f", dollars)
+    }
+
+    private func parseOpenCodeConsoleGoStatus(
+        data: Data,
+        walletBalanceText: String?,
+        resolvedExternalId: String?
+    ) -> ProviderQuotaResult? {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        let product = (json["product"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let planBadge: String
+        switch product {
+        case "go":
+            planBadge = "Go"
+        case "go-plus":
+            planBadge = "Go Plus"
+        case "go-teams":
+            planBadge = "Go Teams"
+        default:
+            return nil
+        }
+
+        guard let accessObj = json["access"] as? [String: Any],
+              let meters = accessObj["meters"] as? [String: Any] else {
+            return nil
+        }
+
+        struct MeterSpec {
+            let key: String
+            let windowId: String
+            let label: String
+        }
+        let specs: [MeterSpec] = [
+            MeterSpec(key: "fiveHour", windowId: "opencode-go.5h", label: "5h 滚动窗口"),
+            MeterSpec(key: "week", windowId: "opencode-go.7d", label: "7d 周限额"),
+            MeterSpec(key: "month", windowId: "opencode-go.month", label: "月度额度"),
+        ]
+
+        var windows: [QuotaWindow] = []
+        var fiveHourDollarsText: String?
+        var weekDollarsText: String?
+        var monthSummaryText: String?
+
+        for spec in specs {
+            guard let meter = meters[spec.key] as? [String: Any],
+                  let limitMicro = optionalDoubleValue(meter["limitMicroCents"]),
+                  limitMicro > 0 else {
+                continue
+            }
+            let usedMicro = max(0, optionalDoubleValue(meter["usedMicroCents"]) ?? 0)
+            let usedDollars = usedMicro / Self.openCodeMicroCentsPerDollar
+            let limitDollars = limitMicro / Self.openCodeMicroCentsPerDollar
+            let usedPct = min(100.0, max(0.0, (usedMicro / limitMicro) * 100.0))
+            let usedStr = String(format: "$%.2f", usedDollars)
+            let limitStr = String(format: "$%.2f", limitDollars)
+            let detail = "\(usedStr) / \(limitStr)"
+            let resetAt = parseISO8601(meter["resetsAt"] as? String)
+                ?? epochSecondsDate(meter["resetsAt"])
+
+            if spec.key == "fiveHour" { fiveHourDollarsText = usedStr }
+            if spec.key == "week" { weekDollarsText = usedStr }
+            if spec.key == "month" { monthSummaryText = detail }
+
+            windows.append(QuotaWindow(
+                id: spec.windowId,
+                label: spec.label,
+                usedPercent: usedPct,
+                detailText: detail,
+                resetAt: resetAt
+            ))
+        }
+
+        guard !windows.isEmpty else { return nil }
+
+        let surfaceParts: [String] = [
+            fiveHourDollarsText.map { "5h \($0)" },
+            weekDollarsText.map { "7d \($0)" },
+        ].compactMap { $0 }
+
+        let cloudBilling: CloudBillingSummary? = monthSummaryText.map { monthText in
+            CloudBillingSummary(
+                sourceName: "OpenCode 官方配额",
+                periodLabel: "本月",
+                periodSpendText: monthText,
+                surfaceSummary: surfaceParts.isEmpty ? nil : surfaceParts.joined(separator: " · ")
+            )
+        }
+
+        let subscriberId = (json["subscriberUserId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let wsID = Self.extractOpenCodeWorkspaceID(from: json["orgID"] as? String ?? json["workspaceId"] as? String)
+            ?? resolvedExternalId
+            ?? ((subscriberId?.isEmpty == false) ? subscriberId : nil)
+
+        return ProviderQuotaResult(
+            resolvedExternalId: wsID,
+            planBadge: planBadge,
+            windows: windows,
+            walletBalanceText: walletBalanceText,
+            cloudBilling: cloudBilling
+        )
+    }
+
+    private func parseOpenCodeZenGoUsage(
+        json: [String: Any]?,
+        resolvedExternalId: String?
+    ) -> ProviderQuotaResult? {
+        guard let json else { return nil }
+        let usageRoot = (json["usage"] as? [String: Any])
+            ?? (json["data"] as? [String: Any])
+            ?? json
+
+        func parseBucket(_ keys: [String], id: String, label: String) -> QuotaWindow? {
+            guard let bucket = keys.lazy.compactMap({ usageRoot[$0] as? [String: Any] }).first else {
+                return nil
+            }
+            var usedPct = optionalDoubleValue(bucket["percent"])
+                ?? optionalDoubleValue(bucket["usagePercent"])
+                ?? optionalDoubleValue(bucket["usedPercent"])
+                ?? optionalDoubleValue(bucket["used_percent"])
+
+            var detailText: String? = nil
+            if let usedMicro = optionalDoubleValue(bucket["usedMicroCents"]),
+               let limitMicro = optionalDoubleValue(bucket["limitMicroCents"]),
+               limitMicro > 0 {
+                let u = max(0, usedMicro) / Self.openCodeMicroCentsPerDollar
+                let l = limitMicro / Self.openCodeMicroCentsPerDollar
+                detailText = String(format: "$%.2f / $%.2f", u, l)
+                if usedPct == nil {
+                    usedPct = (max(0, usedMicro) / limitMicro) * 100.0
+                }
+            } else if let usedUSD = optionalDoubleValue(bucket["usageDollars"] ?? bucket["usedDollars"] ?? bucket["used"]),
+                      let limitUSD = optionalDoubleValue(bucket["limitDollars"] ?? bucket["limit"]),
+                      limitUSD > 0 {
+                detailText = String(format: "$%.2f / $%.2f", max(0, usedUSD), limitUSD)
+                if usedPct == nil {
+                    usedPct = (max(0, usedUSD) / limitUSD) * 100.0
+                }
+            }
+
+            guard let pct = usedPct else { return nil }
+
+            let resetAt: Date? = {
+                if let iso = parseISO8601((bucket["resetsAt"] as? String) ?? (bucket["resetAt"] as? String) ?? (bucket["reset_at"] as? String)) {
+                    return iso
+                }
+                if let epoch = epochSecondsDate(bucket["resetsAt"] ?? bucket["resetAt"] ?? bucket["reset_at"]) {
+                    return epoch
+                }
+                if let inSec = optionalDoubleValue(bucket["resetInSec"] ?? bucket["reset_in_sec"]), inSec > 0 {
+                    return Date().addingTimeInterval(inSec)
+                }
+                return nil
+            }()
+
+            return QuotaWindow(
+                id: id,
+                label: label,
+                usedPercent: pct,
+                detailText: detailText,
+                resetAt: resetAt
+            )
+        }
+
+        var windows: [QuotaWindow] = []
+        if let w5h = parseBucket(["rolling", "fiveHour", "rolling5h", "five_hour"], id: "opencode-go.5h", label: "5h 滚动窗口") {
+            windows.append(w5h)
+        }
+        if let w7d = parseBucket(["weekly", "week", "sevenDay", "seven_day"], id: "opencode-go.7d", label: "7d 周限额") {
+            windows.append(w7d)
+        }
+        if let wMonth = parseBucket(["monthly", "month", "thirtyDay", "thirty_day"], id: "opencode-go.month", label: "月度额度") {
+            windows.append(wMonth)
+        }
+
+        guard !windows.isEmpty else { return nil }
+
+        let rawPlan = ((json["plan"] as? String) ?? (usageRoot["plan"] as? String) ?? (json["product"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let planBadge: String = {
+            switch rawPlan {
+            case "go-plus": return "Go Plus"
+            case "go-teams": return "Go Teams"
+            default: return "Go"
+            }
+        }()
+
+        return ProviderQuotaResult(
+            resolvedExternalId: resolvedExternalId,
+            planBadge: planBadge,
+            windows: windows
+        )
     }
 
     // MARK: - Shared Helpers

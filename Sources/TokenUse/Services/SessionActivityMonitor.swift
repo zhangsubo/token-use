@@ -366,29 +366,45 @@ private actor SessionActivityScanner {
         var result = Set<TrackedProvider>()
 
         // OpenCode SQLite
-        let openCodeDir = homeDirectory.appendingPathComponent(".local/share/opencode")
-        let dbURL = openCodeDir.appendingPathComponent("opencode.db")
-        let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
-        let ocAge = min(
-            modificationDate(of: dbURL).map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude,
-            modificationDate(of: walURL).map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        )
-        if ocAge <= 75.0,
-           fileManager.fileExists(atPath: dbURL.path),
-           let db = try? Connection(dbURL.path, readonly: true) {
-            let dataStr = (try? db.scalar("SELECT data FROM session_message ORDER BY rowid DESC LIMIT 1") as? String)
-                ?? (try? db.scalar("SELECT data FROM message ORDER BY rowid DESC LIMIT 1") as? String)
-            if let dataStr,
-               let data = dataStr.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let modelDict = obj["model"] as? [String: Any]
-                let modelId = (modelDict?["id"] as? String) ?? (obj["modelID"] as? String) ?? ""
-                let providerId = (modelDict?["providerID"] as? String) ?? (obj["providerID"] as? String) ?? "opencode"
-                if let tracked = TrackedProvider.classify(client: "opencode", provider: providerId, model: modelId) {
-                    let timeObj = obj["time"] as? [String: Any]
-                    let incomplete = (obj["role"] as? String == "assistant") && (timeObj?["completed"] == nil) && (obj["error"] == nil)
-                    if ocAge <= 6.0 || incomplete {
-                        result.insert(tracked)
+        var openCodeDirs: [URL] = [homeDirectory.appendingPathComponent(".local/share/opencode")]
+        if let xdgData = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !xdgData.isEmpty {
+            openCodeDirs.insert(URL(fileURLWithPath: expandTilde(xdgData)).appendingPathComponent("opencode"), at: 0)
+        }
+        for acct in accounts where acct.provider == .opencodeGo {
+            if let custom = acct.customLogPath, !custom.isEmpty {
+                let expanded = URL(fileURLWithPath: expandTilde(custom))
+                openCodeDirs.append(expanded.pathExtension == "db" ? expanded.deletingLastPathComponent() : expanded)
+            }
+        }
+        var seenOpenCodeDBs = Set<String>()
+        for openCodeDir in openCodeDirs {
+            let dbURL = openCodeDir.appendingPathComponent("opencode.db")
+            let canonicalDB = dbURL.standardizedFileURL.path
+            guard seenOpenCodeDBs.insert(canonicalDB).inserted else { continue }
+            let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+            let ocAge = min(
+                modificationDate(of: dbURL).map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude,
+                modificationDate(of: walURL).map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+            )
+            if ocAge <= 75.0,
+               fileManager.fileExists(atPath: dbURL.path),
+               let db = try? Connection(dbURL.path, readonly: true) {
+                let dataStr = (try? db.scalar("SELECT data FROM session_message ORDER BY rowid DESC LIMIT 1") as? String)
+                    ?? (try? db.scalar("SELECT data FROM message ORDER BY rowid DESC LIMIT 1") as? String)
+                if let dataStr,
+                   let data = dataStr.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let modelDict = obj["model"] as? [String: Any]
+                    let modelId = (modelDict?["id"] as? String) ?? (obj["modelID"] as? String) ?? ""
+                    let providerId = (modelDict?["providerID"] as? String) ?? (obj["providerID"] as? String) ?? "opencode"
+                    if let tracked = TrackedProvider.classify(client: "opencode", provider: providerId, model: modelId) {
+                        let timeObj = obj["time"] as? [String: Any]
+                        let incomplete = (obj["role"] as? String == "assistant") && (timeObj?["completed"] == nil) && (obj["error"] == nil)
+                        if ocAge <= 6.0 || incomplete {
+                            result.insert(tracked)
+                        }
                     }
                 }
             }

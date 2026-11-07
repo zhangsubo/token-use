@@ -28,6 +28,7 @@ enum AccountDiscoveryService {
             discoverCodex(home: home, into: &discovered, secrets: &secrets, activeIds: &activeCodexIds)
             discoverMiMoAndMiniMaxAndKimi(home: home, into: &discovered, secrets: &secrets)
             discoverAntigravity(home: home, into: &discovered, secrets: &secrets)
+            discoverOpenCodeGo(home: home, into: &discovered, secrets: &secrets)
         }
 
         // 若手动添加的 Codex OAuth 账号恰好是当前 ~/.codex/auth.json 活跃账号，同样标记激活态
@@ -163,7 +164,8 @@ enum AccountDiscoveryService {
                 if !lowerCfg.contains("xiaomimimo.com")
                     && !lowerCfg.contains("minimaxi.com")
                     && !lowerCfg.contains("minimax.io")
-                    && !lowerCfg.contains("kimi.com") {
+                    && !lowerCfg.contains("kimi.com")
+                    && !lowerCfg.contains("opencode.ai") {
                     let id = "auto.codex.apikey.\(shortHash(apiKey))"
                     activeIds.insert(id)
                     secrets[id] = apiKey
@@ -876,6 +878,528 @@ enum AccountDiscoveryService {
                 customLogPath: firstAgy.path
             ))
         }
+    }
+
+    // MARK: - 4. OpenCode Go Discovery
+
+    private static func discoverOpenCodeGo(
+        home: URL,
+        into accounts: inout [ProviderAccountConfig],
+        secrets: inout [String: String]
+    ) {
+        let envMap = ProcessInfo.processInfo.environment
+        var seenKeyHashes = Set<String>()
+        var seenOAuthHashes = Set<String>()
+
+        struct SharedCandidate {
+            let rawKey: String
+            let label: String
+            let regionOrBaseURL: String?
+            let filePath: String?
+            let origin: String
+            let logPath: String?
+        }
+        var sharedCandidates: [SharedCandidate] = []
+
+        func resolveEnvPlaceholder(_ raw: String) -> String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("{env:"), trimmed.hasSuffix("}"), trimmed.count > 6 {
+                let varName = String(trimmed.dropFirst(5).dropLast()).trimmingCharacters(in: .whitespaces)
+                return envMap[varName]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
+            if trimmed.hasPrefix("${"), trimmed.hasSuffix("}"), trimmed.count > 3 {
+                let varName = String(trimmed.dropFirst(2).dropLast()).trimmingCharacters(in: .whitespaces)
+                return envMap[varName]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
+            return trimmed
+        }
+
+        func appendGoKey(
+            rawKey: String,
+            label: String,
+            regionOrBaseURL: String? = nil,
+            filePath: String? = nil,
+            lookupKey: String? = nil,
+            origin: String,
+            logPath: String? = nil
+        ) {
+            let resolved = resolveEnvPlaceholder(rawKey)
+            guard !resolved.isEmpty else { return }
+            let hash = shortHash(resolved)
+            guard seenKeyHashes.insert(hash).inserted else { return }
+
+            let id = "auto.opencode-go.key.\(hash)"
+            secrets[id] = resolved
+            accounts.append(ProviderAccountConfig(
+                id: id,
+                provider: .opencodeGo,
+                label: label,
+                source: .autoDiscovered,
+                authKind: .apiKey,
+                isEnabled: true,
+                regionOrBaseURL: regionOrBaseURL,
+                credentialFilePath: filePath,
+                credentialLookupKey: lookupKey,
+                originDescription: origin,
+                customLogPath: logPath
+            ))
+        }
+
+        func appendGoOAuth(
+            dict: [String: Any],
+            explicitLabel: String?,
+            isExplicitGo: Bool,
+            filePath: String?,
+            origin: String,
+            logPath: String?
+        ) {
+            guard let access = (dict["access"] as? String ?? dict["access_token"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !access.isEmpty else { return }
+            let metadata = dict["metadata"] as? [String: Any]
+            let orgID = ((metadata?["orgID"] as? String)
+                ?? (dict["orgID"] as? String)
+                ?? (dict["accountId"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let server = ((metadata?["server"] as? String) ?? (dict["server"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let seed = (orgID?.isEmpty == false ? orgID! : access)
+            let hash = shortHash(seed)
+            guard seenOAuthHashes.insert(hash).inserted else { return }
+
+            var payload: [String: Any] = ["access": access]
+            if let refresh = dict["refresh"] as? String ?? dict["refresh_token"] as? String, !refresh.isEmpty {
+                payload["refresh"] = refresh
+            }
+            if let expires = dict["expires"] {
+                payload["expires"] = expires
+            }
+            if let orgID, !orgID.isEmpty {
+                payload["orgID"] = orgID
+            }
+            if let server, !server.isEmpty {
+                payload["server"] = server
+            }
+            guard let payloadData = try? JSONSerialization.data(withJSONObject: payload),
+                  let payloadStr = String(data: payloadData, encoding: .utf8) else { return }
+
+            let trimmedLabel = explicitLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let genericLabels: Set<String> = ["default", "api key", "apikey", "oauth", "opencode", "opencode-go"]
+            let email = ((metadata?["email"] as? String) ?? (dict["email"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let orgName = (metadata?["orgName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let displayLabel: String = {
+                if let trimmedLabel, !trimmedLabel.isEmpty, !genericLabels.contains(trimmedLabel.lowercased()) {
+                    return trimmedLabel
+                }
+                if let email, !email.isEmpty {
+                    if let orgName, !orgName.isEmpty,
+                       !["default", "personal"].contains(orgName.lowercased()) {
+                        return "\(email) (\(orgName))"
+                    }
+                    return email
+                }
+                if let orgID, !orgID.isEmpty {
+                    return "OpenCode (\(orgID))"
+                }
+                return "OpenCode Console"
+            }()
+
+            let id = "auto.opencode-go.oauth.\(hash)"
+            secrets[id] = payloadStr
+            accounts.append(ProviderAccountConfig(
+                id: id,
+                provider: .opencodeGo,
+                label: displayLabel,
+                source: .autoDiscovered,
+                authKind: .oauthToken,
+                isEnabled: true,
+                regionOrBaseURL: server,
+                externalAccountId: (orgID?.isEmpty == false) ? orgID : nil,
+                credentialFilePath: filePath,
+                credentialLookupKey: isExplicitGo ? nil : "opencode.console",
+                originDescription: origin,
+                customLogPath: logPath
+            ))
+        }
+
+        // A) OpenCode 数据目录（OpenCode 2.x opencode.db credential 表 + OpenCode 1.x auth.json）
+        var dataDirs: [URL] = []
+        if let xdg = envMap["XDG_DATA_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !xdg.isEmpty {
+            dataDirs.append(URL(fileURLWithPath: xdg).appendingPathComponent("opencode"))
+        }
+        dataDirs.append(home.appendingPathComponent(".local/share/opencode"))
+        let primaryLogPath = dataDirs.first(where: { FileManager.default.fileExists(atPath: $0.path) })?.path
+            ?? home.appendingPathComponent(".local/share/opencode").path
+
+        var seenDataDirPaths = Set<String>()
+        for dataDir in dataDirs {
+            let canonicalDir = dataDir.standardizedFileURL.path
+            guard seenDataDirPaths.insert(canonicalDir).inserted else { continue }
+
+            // 1) OpenCode 2.x SQLite credential 表
+            var hasActiveV2CredentialInDir = false
+            let dbURL = dataDir.appendingPathComponent("opencode.db")
+            if FileManager.default.fileExists(atPath: dbURL.path),
+               let db = try? Connection(dbURL.path, readonly: true),
+               let hasCredTable = try? db.scalar(
+                   "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'credential'"
+               ) as? Int64,
+               hasCredTable > 0 {
+                let sql = "SELECT integration_id, label, value, active FROM credential WHERE integration_id IN ('opencode-go', 'opencode') ORDER BY active DESC, time_updated DESC"
+                if let stmt = try? db.prepare(sql) {
+                    for row in stmt {
+                        guard let integrationId = (row[0] as? String)?.lowercased(),
+                              let valueStr = row[2] as? String,
+                              let valData = valueStr.data(using: .utf8),
+                              let dict = try? JSONSerialization.jsonObject(with: valData) as? [String: Any] else {
+                            continue
+                        }
+                        let activeFlag = row[3] as? Int64
+                        if activeFlag == 0 {
+                            // 记录已在 OpenCode 2.x 中被停用的旧 Key 哈希，防止后续从遗留 auth.json 复活过期凭证
+                            if let oldKey = (dict["key"] as? String) ?? (dict["apiKey"] as? String) ?? (dict["token"] as? String) {
+                                let resolvedOld = resolveEnvPlaceholder(oldKey)
+                                if !resolvedOld.isEmpty {
+                                    seenKeyHashes.insert(shortHash(resolvedOld))
+                                }
+                            }
+                            continue
+                        }
+
+                        hasActiveV2CredentialInDir = true
+                        let rowLabel = row[1] as? String
+                        let credType = (dict["type"] as? String)?.lowercased() ?? ""
+                        let isExplicitGo = (integrationId == "opencode-go")
+
+                        if credType == "oauth" || dict["access"] != nil {
+                            appendGoOAuth(
+                                dict: dict,
+                                explicitLabel: rowLabel,
+                                isExplicitGo: isExplicitGo,
+                                filePath: dbURL.path,
+                                origin: "OpenCode",
+                                logPath: dataDir.path
+                            )
+                        } else if let key = (dict["key"] as? String) ?? (dict["apiKey"] as? String) ?? (dict["token"] as? String) {
+                            let cleanRowLabel = rowLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let isGenericKeyLabel = cleanRowLabel.map { ["default", "api key", "apikey"].contains($0.lowercased()) } ?? true
+                            let labelText = (!isGenericKeyLabel ? cleanRowLabel : nil)
+                                ?? (isExplicitGo ? "OpenCode Go" : "OpenCode Go (opencode)")
+                            if isExplicitGo {
+                                appendGoKey(
+                                    rawKey: key,
+                                    label: labelText,
+                                    filePath: dbURL.path,
+                                    origin: "OpenCode",
+                                    logPath: dataDir.path
+                                )
+                            } else {
+                                sharedCandidates.append(SharedCandidate(
+                                    rawKey: key,
+                                    label: labelText,
+                                    regionOrBaseURL: nil,
+                                    filePath: dbURL.path,
+                                    origin: "OpenCode",
+                                    logPath: dataDir.path
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2) OpenCode 1.x auth.json（仅当同目录 opencode.db 尚无活跃 2.x 凭证时回退读取，避免残留过期文件重复出卡）
+            let authURL = dataDir.appendingPathComponent("auth.json")
+            if !hasActiveV2CredentialInDir, let root = readJSONDictionary(at: authURL) {
+                for providerKey in ["opencode-go", "opencode"] {
+                    guard let dict = root[providerKey] as? [String: Any] else { continue }
+                    let credType = (dict["type"] as? String)?.lowercased() ?? ""
+                    let isExplicitGo = (providerKey == "opencode-go")
+                    if credType == "oauth" || dict["access"] != nil {
+                        appendGoOAuth(
+                            dict: dict,
+                            explicitLabel: nil,
+                            isExplicitGo: isExplicitGo,
+                            filePath: authURL.path,
+                            origin: "OpenCode",
+                            logPath: dataDir.path
+                        )
+                    } else if let key = (dict["key"] as? String) ?? (dict["apiKey"] as? String) ?? (dict["token"] as? String) {
+                        if isExplicitGo {
+                            appendGoKey(
+                                rawKey: key,
+                                label: "OpenCode Go",
+                                filePath: authURL.path,
+                                origin: "OpenCode",
+                                logPath: dataDir.path
+                            )
+                        } else {
+                            sharedCandidates.append(SharedCandidate(
+                                rawKey: key,
+                                label: "OpenCode Go (opencode)",
+                                regionOrBaseURL: nil,
+                                filePath: authURL.path,
+                                origin: "OpenCode",
+                                logPath: dataDir.path
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        // A3) OPENCODE_AUTH_CONTENT 环境变量 JSON
+        if let rawAuthContent = envMap["OPENCODE_AUTH_CONTENT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawAuthContent.isEmpty,
+           let authData = rawAuthContent.data(using: .utf8),
+           let root = try? JSONSerialization.jsonObject(with: authData) as? [String: Any] {
+            for providerKey in ["opencode-go", "opencode"] {
+                guard let dict = root[providerKey] as? [String: Any] else { continue }
+                let credType = (dict["type"] as? String)?.lowercased() ?? ""
+                let isExplicitGo = (providerKey == "opencode-go")
+                if credType == "oauth" || dict["access"] != nil {
+                    appendGoOAuth(
+                        dict: dict,
+                        explicitLabel: nil,
+                        isExplicitGo: isExplicitGo,
+                        filePath: nil,
+                        origin: "ENV",
+                        logPath: primaryLogPath
+                    )
+                } else if let key = (dict["key"] as? String) ?? (dict["apiKey"] as? String) {
+                    if isExplicitGo {
+                        appendGoKey(rawKey: key, label: "OpenCode Go (ENV)", origin: "ENV", logPath: primaryLogPath)
+                    } else {
+                        sharedCandidates.append(SharedCandidate(
+                            rawKey: key,
+                            label: "OpenCode Go (ENV)",
+                            regionOrBaseURL: nil,
+                            filePath: nil,
+                            origin: "ENV",
+                            logPath: primaryLogPath
+                        ))
+                    }
+                }
+            }
+        }
+
+        // B) OpenCode 配置文件 opencode.json / config.json（支持 JSONC 单行注释）
+        var configURLs: [URL] = []
+        if let customCfgDir = envMap["OPENCODE_CONFIG_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines), !customCfgDir.isEmpty {
+            let dir = URL(fileURLWithPath: customCfgDir)
+            configURLs.append(dir.appendingPathComponent("opencode.json"))
+            configURLs.append(dir.appendingPathComponent("opencode.jsonc"))
+        }
+        let defaultCfgDir = home.appendingPathComponent(".config/opencode")
+        configURLs.append(defaultCfgDir.appendingPathComponent("opencode.json"))
+        configURLs.append(defaultCfgDir.appendingPathComponent("opencode.jsonc"))
+        configURLs.append(defaultCfgDir.appendingPathComponent("config.json"))
+
+        for cfgURL in configURLs {
+            guard let root = readJSONOrJSONCDictionary(at: cfgURL),
+                  let providers = root["provider"] as? [String: Any] else { continue }
+            if let goObj = providers["opencode-go"] as? [String: Any] {
+                let opts = goObj["options"] as? [String: Any]
+                if let rawKey = (opts?["apiKey"] as? String) ?? (goObj["apiKey"] as? String) {
+                    appendGoKey(
+                        rawKey: rawKey,
+                        label: "OpenCode Go (opencode.json)",
+                        regionOrBaseURL: (opts?["baseURL"] as? String) ?? (goObj["baseURL"] as? String),
+                        filePath: cfgURL.path,
+                        origin: "opencode.json",
+                        logPath: primaryLogPath
+                    )
+                }
+            }
+        }
+
+        // C) Claude Code settings.json: ~/.claude/settings.json
+        let claudeSettingsURL = home.appendingPathComponent(".claude/settings.json")
+        if let root = readJSONDictionary(at: claudeSettingsURL),
+           let env = root["env"] as? [String: Any] {
+            let token = (env["ANTHROPIC_AUTH_TOKEN"] as? String) ?? (env["ANTHROPIC_API_KEY"] as? String)
+            let baseURL = (env["ANTHROPIC_BASE_URL"] as? String) ?? ""
+            let lowerURL = baseURL.lowercased()
+            if let token, !token.isEmpty,
+               (lowerURL.contains("opencode.ai/zen/go") || token.hasPrefix("oc_sk_")) {
+                appendGoKey(
+                    rawKey: token,
+                    label: "OpenCode Go (Claude Code)",
+                    regionOrBaseURL: baseURL.isEmpty ? nil : baseURL,
+                    filePath: claudeSettingsURL.path,
+                    origin: "~/.claude"
+                )
+            }
+        }
+
+        // D) CC Switch 数据库: ~/.cc-switch/cc-switch.db
+        let ccDBURL = home.appendingPathComponent(".cc-switch/cc-switch.db")
+        if FileManager.default.fileExists(atPath: ccDBURL.path),
+           let db = try? Connection(ccDBURL.path, readonly: true) {
+            let sql = "SELECT id, app_type, name, settings_config, website_url, icon, meta FROM providers ORDER BY sort_index ASC, created_at ASC"
+            if let stmt = try? db.prepare(sql) {
+                for row in stmt {
+                    let rowId = ((row[0] as? String) ?? "").lowercased()
+                    let appType = (row[1] as? String) ?? ""
+                    let name = (row[2] as? String) ?? ""
+                    let settingsStr = (row[3] as? String) ?? "{}"
+                    let websiteURL = (row[4] as? String) ?? ""
+                    let icon = ((row[5] as? String) ?? "").lowercased()
+                    let metaStr = (row[6] as? String) ?? "{}"
+
+                    let settings = (settingsStr.data(using: .utf8)).flatMap {
+                        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+                    } ?? [:]
+                    let meta = (metaStr.data(using: .utf8)).flatMap {
+                        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+                    } ?? [:]
+
+                    let extracted = extractCCSwitchCredentials(settings: settings, websiteURL: websiteURL)
+                    guard let apiKey = extracted.apiKey, !apiKey.isEmpty else { continue }
+                    let lowerURL = (extracted.baseURL ?? websiteURL).lowercased()
+                    let codingPlanProvider = ((meta["usage_script"] as? [String: Any])?["codingPlanProvider"] as? String)?.lowercased()
+
+                    if rowId.contains("opencode-go") || icon == "opencode-go" || codingPlanProvider == "opencode-go"
+                        || lowerURL.contains("opencode.ai/zen/go") || apiKey.hasPrefix("oc_sk_") {
+                        appendGoKey(
+                            rawKey: apiKey,
+                            label: name.isEmpty ? "OpenCode Go (\(appType))" : "\(name) (\(appType))",
+                            regionOrBaseURL: extracted.baseURL ?? websiteURL,
+                            filePath: ccDBURL.path,
+                            origin: "CC Switch"
+                        )
+                    }
+                }
+            }
+        }
+
+        // E) Codex 自定义路由指向 OpenCode Go ($CODEX_HOME/config.toml + auth.json)
+        let codexHome = CodexAccountSwitchService.codexHomeDirectory(home: home)
+        let codexAuthURL = codexHome.appendingPathComponent("auth.json")
+        if let root = readJSONDictionary(at: codexAuthURL),
+           let apiKey = root["OPENAI_API_KEY"] as? String,
+           !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let configText = (try? String(contentsOf: codexHome.appendingPathComponent("config.toml"), encoding: .utf8)) ?? ""
+            if configText.lowercased().contains("opencode.ai/zen/go") {
+                appendGoKey(
+                    rawKey: apiKey,
+                    label: "OpenCode Go (codex)",
+                    regionOrBaseURL: extractTOMLValue(key: "base_url", in: configText),
+                    filePath: codexAuthURL.path,
+                    origin: "~/.codex",
+                    logPath: codexHome.path
+                )
+            }
+        }
+
+        // F) 环境变量 OPENCODE_GO_API_KEY / OPENCODE_GO_COOKIE / OPENCODE_API_KEY
+        if let envGoKey = envMap["OPENCODE_GO_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envGoKey.isEmpty {
+            appendGoKey(rawKey: envGoKey, label: "OpenCode Go (ENV)", origin: "ENV", logPath: primaryLogPath)
+        }
+        if let envGoCookie = envMap["OPENCODE_GO_COOKIE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envGoCookie.isEmpty {
+            let id = "auto.opencode-go.cookie.\(shortHash(envGoCookie))"
+            let orgOverride = (envMap["OPENCODE_GO_ORG_ID"] ?? envMap["OPENCODE_ORG_ID"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            secrets[id] = envGoCookie
+            accounts.append(ProviderAccountConfig(
+                id: id,
+                provider: .opencodeGo,
+                label: "OpenCode Console (ENV)",
+                source: .autoDiscovered,
+                authKind: .cookie,
+                isEnabled: true,
+                externalAccountId: (orgOverride?.isEmpty == false) ? orgOverride : nil,
+                originDescription: "ENV",
+                customLogPath: primaryLogPath
+            ))
+        }
+        if let envSharedKey = envMap["OPENCODE_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envSharedKey.isEmpty {
+            sharedCandidates.append(SharedCandidate(
+                rawKey: envSharedKey,
+                label: "OpenCode Go (ENV)",
+                regionOrBaseURL: nil,
+                filePath: nil,
+                origin: "ENV",
+                logPath: primaryLogPath
+            ))
+        }
+
+        // 若未配置独立 opencode-go key，回退尝试复用的 opencode key（无 Go 订阅时由面板自动静默过滤）
+        let hasExplicitGoKey = !seenKeyHashes.isEmpty
+        if !hasExplicitGoKey {
+            for candidate in sharedCandidates {
+                appendGoKey(
+                    rawKey: candidate.rawKey,
+                    label: candidate.label,
+                    regionOrBaseURL: candidate.regionOrBaseURL,
+                    filePath: candidate.filePath,
+                    lookupKey: "opencode.shared",
+                    origin: candidate.origin,
+                    logPath: candidate.logPath
+                )
+            }
+        }
+    }
+
+    private static func readJSONOrJSONCDictionary(at url: URL) -> [String: Any]? {
+        if let plain = readJSONDictionary(at: url) {
+            return plain
+        }
+        guard FileManager.default.fileExists(atPath: url.path),
+              let raw = try? String(contentsOf: url, encoding: .utf8) else {
+            return nil
+        }
+        var stripped = ""
+        stripped.reserveCapacity(raw.count)
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: false) {
+            var inString = false
+            var escaped = false
+            var prevSlash = false
+            var cutIdx: String.Index? = nil
+            var i = line.startIndex
+            while i < line.endIndex {
+                let ch = line[i]
+                if inString {
+                    if escaped {
+                        escaped = false
+                    } else if ch == "\\" {
+                        escaped = true
+                    } else if ch == "\"" {
+                        inString = false
+                    }
+                } else {
+                    if ch == "\"" {
+                        inString = true
+                        prevSlash = false
+                    } else if ch == "/" {
+                        if prevSlash {
+                            cutIdx = line.index(before: i)
+                            break
+                        }
+                        prevSlash = true
+                        i = line.index(after: i)
+                        continue
+                    } else {
+                        prevSlash = false
+                    }
+                }
+                i = line.index(after: i)
+            }
+            if let cutIdx {
+                stripped.append(contentsOf: line[..<cutIdx])
+            } else {
+                stripped.append(contentsOf: line)
+            }
+            stripped.append("\n")
+        }
+        guard let data = stripped.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
     // MARK: - Helpers

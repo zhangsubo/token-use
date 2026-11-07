@@ -884,11 +884,17 @@ actor NativeUsageService {
         }
     }
 
-    // MARK: - 4. OpenCode & Claude Routed Scanner (MiniMax / MiMo / Kimi 跨客户端调用)
+    // MARK: - 4. OpenCode & Claude Routed Scanner (OpenCode Go / MiniMax / MiMo / Kimi 跨客户端调用)
 
     private func scanOpenCode(state: inout DualScanState) {
-        var dirs: [URL] = [homeDirectory.appendingPathComponent(".local/share/opencode")]
-        for acct in state.accounts where acct.provider == .minimax {
+        var dirs: [URL] = []
+        if let xdgData = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !xdgData.isEmpty {
+            dirs.append(URL(fileURLWithPath: expandTilde(xdgData)).appendingPathComponent("opencode"))
+        }
+        dirs.append(homeDirectory.appendingPathComponent(".local/share/opencode"))
+        for acct in state.accounts where acct.provider == .minimax || acct.provider == .opencodeGo {
             if let custom = acct.customLogPath, !custom.isEmpty {
                 dirs.append(URL(fileURLWithPath: expandTilde(custom)))
             }

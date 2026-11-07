@@ -253,6 +253,7 @@ final class SettingsManager: ObservableObject {
         "Kimi", "Kimi 账号", "Kimi Code", "Kimi Code 账号", "Kimi API", "Kimi Web",
         "MiniMax", "MiniMax 账号", "MiniMax Code", "MiniMax Code 本机日志",
         "Antigravity", "Antigravity 账号", "Antigravity IDE", "Antigravity CLI", "Antigravity 本机服务",
+        "OpenCode Go", "OpenCode Go 账号", "OpenCode Console", "OpenCode Go 本机日志",
     ]
 
     private nonisolated static let genericOuterAccountPrefixes: Set<String> = [
@@ -261,12 +262,13 @@ final class SettingsManager: ObservableObject {
         "Kimi", "Kimi Code", "Kimi API", "Kimi Web",
         "MiniMax", "MiniMax Code",
         "Antigravity",
+        "OpenCode", "OpenCode Go", "OpenCode Console",
     ]
 
     private nonisolated static let genericInnerAccountTags: Set<String> = [
-        "API Key", "ENV", "MIMO_COOKIE", "Claude Code", "OpenCode", "Kimi Desktop",
+        "API Key", "ENV", "OAuth", "MIMO_COOKIE", "Claude Code", "OpenCode", "OpenCode Console", "Kimi Desktop",
         "Local RPC", "Antigravity Tools", "CLIProxyAPI",
-        "claude", "codex", "opencode", "gemini", "mimocode", "mimocode.json",
+        "claude", "codex", "opencode", "opencode-go", "opencode.json", "gemini", "mimocode", "mimocode.json",
         "minimax-cn-coding-plan", "minimax-coding-plan", "minimax", "xiaomi", "mimo", "kimi-code", "kimi-for-coding",
     ]
 

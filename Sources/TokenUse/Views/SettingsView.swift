@@ -1173,8 +1173,13 @@ private struct AccountEditorSheet: View {
 
                 TextField("区域或自定义接口地址（可选：cn / global 或 https://...）", text: $regionOrBaseURL)
 
-                if provider == .codex && !isAutoDiscovered {
-                    TextField("ChatGPT Account / Workspace ID（可选，多团队工作区使用）", text: $externalAccountId)
+                if (provider == .codex || provider == .opencodeGo) && !isAutoDiscovered {
+                    TextField(
+                        provider == .opencodeGo
+                            ? "OpenCode 工作区 ID（可选，如 wrk_... / org_...，OAuth 或多工作区 Cookie 使用）"
+                            : "ChatGPT Account / Workspace ID（可选，多团队工作区使用）",
+                        text: $externalAccountId
+                    )
                 }
 
                 HStack(spacing: 8) {
@@ -1221,6 +1226,8 @@ private struct AccountEditorSheet: View {
         switch (provider, authKind) {
         case (.kimi, .cookie):
             return "粘贴 Kimi 网页端 Cookie（含 kimi-auth=...，安全存入 macOS Keychain）"
+        case (.opencodeGo, .cookie):
+            return "粘贴 OpenCode 网页端 Cookie（含 auth=... 或 __Host-console_session=...，存入 Keychain）"
         case (_, .cookie):
             return "控制台 Cookie（存入 macOS Keychain）"
         case (.codex, .oauthToken):
@@ -1229,6 +1236,10 @@ private struct AccountEditorSheet: View {
             return "粘贴 Google OAuth JSON 或 refresh_token（存入 Keychain）"
         case (.kimi, .oauthToken):
             return "粘贴 Kimi OAuth JSON（含 access_token / refresh_token）"
+        case (.opencodeGo, .oauthToken):
+            return "粘贴 OpenCode OAuth JSON（含 access 与 orgID）或访问令牌（存入 Keychain）"
+        case (.opencodeGo, .apiKey):
+            return "粘贴 OpenCode Go API Key（安全存入 macOS Keychain，留空则保持原值）"
         default:
             return "API Key / Token（安全存入 macOS Keychain，留空则保持原值）"
         }
@@ -1241,6 +1252,7 @@ private struct AccountEditorSheet: View {
         case .kimi: return .apiKey
         case .minimax: return .apiKey
         case .antigravity: return .oauthToken
+        case .opencodeGo: return .apiKey
         }
     }
 

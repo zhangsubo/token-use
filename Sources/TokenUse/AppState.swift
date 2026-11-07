@@ -310,6 +310,7 @@ final class AppState: ObservableObject {
                        let resolved = q?.resolvedLabel, !resolved.isEmpty,
                        (acct.label.hasPrefix("Kimi Code (")
                         || acct.label.hasPrefix("Xiaomi MiMo")
+                        || acct.label.hasPrefix("OpenCode")
                         || acct.label.contains("本机")) {
                         return resolved
                     }
@@ -458,6 +459,36 @@ final class AppState: ObservableObject {
                         && snap.allTimeTokens == 0
                         && snap.quotaWindows.isEmpty
                         && snap.quotaError != nil
+                }
+            }
+
+            // 若从通用 opencode 凭证探测发现未开通 Go 订阅且无任何 Go 会话日志，默认静默隐藏避免干扰纯 Zen 用户（除非用户显式开启）
+            if provider == .opencodeGo {
+                let silentSharedIds = Set(
+                    pAccounts
+                        .filter {
+                            $0.source == .autoDiscovered
+                                && ($0.credentialLookupKey == "opencode.shared" || $0.credentialLookupKey == "opencode.console")
+                        }
+                        .map(\.id)
+                )
+                let autoIds = Set(pAccounts.filter { $0.source == .autoDiscovered }.map(\.id))
+                let hasWorkingGoSnapshot = snapshots.contains { !$0.quotaWindows.isEmpty }
+                snapshots.removeAll { snap in
+                    let explicitOverride = SettingsManager.shared.accountOverrides[snap.id]?.isEnabled == true
+                    guard !explicitOverride,
+                          snap.todayTokens == 0,
+                          snap.allTimeTokens == 0,
+                          snap.quotaWindows.isEmpty else {
+                        return false
+                    }
+                    if silentSharedIds.contains(snap.id) && snap.quotaError == nil {
+                        return true
+                    }
+                    if hasWorkingGoSnapshot && autoIds.contains(snap.id) && snap.quotaError != nil {
+                        return true
+                    }
+                    return false
                 }
             }
 

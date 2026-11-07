@@ -130,7 +130,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private var isVisible = false
     private var edge: DockEdge = .right
     private let triggerWidth: CGFloat = 50
-    private let triggerHeight: CGFloat = 244
+    private let triggerHeight: CGFloat = 274
     private let verticalMargin: CGFloat = 8
     private let magneticSnapDistance: CGFloat = 96
     private let panelWidth: CGFloat = 644
@@ -546,6 +546,11 @@ final class EdgeWindowManager: NSObject, ObservableObject {
             menu.addItem(resetItem)
         }
 
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
         return menu
     }
 
@@ -564,6 +569,10 @@ final class EdgeWindowManager: NSObject, ObservableObject {
 
     @objc private func resetDockToDefault() {
         SettingsManager.shared.resetDockPosition()
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 
     // MARK: - Show / Hide
@@ -617,6 +626,18 @@ final class EdgeWindowManager: NSObject, ObservableObject {
                 self.performHide()
             }
         }
+    }
+
+    /// 主动收回主面板（若处于固定状态则同步取消固定并滑回屏幕边缘）
+    func collapsePanel() {
+        guard !isModalPresenting, !isDraggingDock else { return }
+        cancelShowTimer()
+        cancelHideTimer()
+        isPinned = false
+        TriggerState.shared.isHovered = false
+        suppressHoverOpenUntil = Date().addingTimeInterval(0.45)
+        guard isVisible else { return }
+        performHide()
     }
 
     func cancelHideTimer() {
@@ -830,7 +851,7 @@ struct TriggerIndicator: View {
                 }
             }
         }
-        .help("按住可自由拖动到屏幕左/右侧或上下任意高度 · 右键可快捷定位")
+        .help("按住可自由拖动到屏幕左/右侧或上下任意高度 · 右键可快捷定位或退出")
     }
 }
 
@@ -921,7 +942,7 @@ private struct TriggerCapsuleWithArrow: View {
                         .fill(.white.opacity(0.14))
                         .frame(width: 24, height: 0.7)
 
-                    VStack(spacing: 5.5) {
+                    VStack(spacing: 5) {
                         ForEach(settings.providerOrder) { provider in
                             let group = dashboard?.providers.first { $0.provider == provider }
                             EdgeDockProviderGauge(
@@ -955,7 +976,7 @@ private struct TriggerCapsuleWithArrow: View {
                 .padding(.horizontal, 10)
             }
         }
-        .frame(width: isVertical ? 42 : 232, height: isVertical ? 232 : 42)
+        .frame(width: isVertical ? 42 : 262, height: isVertical ? 262 : 42)
         .scaleEffect(isDragging ? 1.03 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isDragging)
     }

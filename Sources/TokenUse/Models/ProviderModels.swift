@@ -4,13 +4,14 @@ import SwiftUI
 
 // MARK: - TrackedProvider
 
-/// 核心支持的 5 大 AI 编程平台
+/// 核心支持的 6 大 AI 编程平台
 enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
     case codex = "codex"
     case mimo = "mimo"
     case kimi = "kimi"
     case minimax = "minimax"
     case antigravity = "antigravity"
+    case opencodeGo = "opencode-go"
 
     var id: String { rawValue }
 
@@ -21,6 +22,7 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .kimi: return "Kimi Code"
         case .minimax: return "MiniMax"
         case .antigravity: return "Antigravity"
+        case .opencodeGo: return "OpenCode Go"
         }
     }
 
@@ -31,6 +33,7 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .kimi: return "Kimi"
         case .minimax: return "MiniMax"
         case .antigravity: return "Antigravity"
+        case .opencodeGo: return "OpenCode Go"
         }
     }
 
@@ -41,6 +44,7 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .kimi: return "Moonshot"
         case .minimax: return "MiniMax"
         case .antigravity: return "Google"
+        case .opencodeGo: return "OpenCode"
         }
     }
 
@@ -51,6 +55,7 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .kimi: return "moon.stars.fill"
         case .minimax: return "waveform.path.ecg"
         case .antigravity: return "sparkles"
+        case .opencodeGo: return "chevron.left.forwardslash.chevron.right"
         }
     }
 
@@ -70,6 +75,8 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
             return Color(.sRGB, red: 0.34, green: 0.84, blue: 0.64)
         case .antigravity:
             return Color(.sRGB, red: 0.96, green: 0.44, blue: 0.68)
+        case .opencodeGo:
+            return Color(.sRGB, red: 0.96, green: 0.78, blue: 0.28)
         }
     }
 
@@ -85,6 +92,8 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
             return "支持 sk-cp-... Token Plan / Coding Plan API Key（自动识别国内 minimaxi.com 与国际版及 ~/.minimax）"
         case .antigravity:
             return "支持自动探测运行中的 Antigravity App/CLI/IDE 分组配额及多份 Google OAuth 凭证"
+        case .opencodeGo:
+            return "支持 OpenCode Go API Key、OpenCode 控制台 OAuth 登录或网页 Cookie（自动读取 ~/.local/share/opencode）"
         }
     }
 
@@ -95,21 +104,26 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .kimi: return "~/.kimi-code"
         case .minimax: return "~/.minimax"
         case .antigravity: return "~/.gemini/antigravity"
+        case .opencodeGo: return "~/.local/share/opencode"
         }
     }
 
-    /// 根据日志客户端、provider、model 归类到 5 大目标平台（不属于这 5 类的返回 nil）
+    /// 根据日志客户端、provider、model 归类到 6 大目标平台（不属于这 6 类的返回 nil）
     static func classify(client: String, provider: String, model: String) -> TrackedProvider? {
         let c = client.lowercased()
         let p = provider.lowercased()
         let m = model.lowercased()
+        let isOpenCodeGo = p == "opencode-go" || p.hasPrefix("opencode-go") || p == "opencode_go" || m.hasPrefix("opencode-go/")
 
         // 1. 专属客户端优先归集（Antigravity / Codex 内部所有模型均归属该平台）
         if c == "antigravity" || p == "antigravity" {
             return .antigravity
         }
         if c == "codex" {
-            // 若在 Codex 中通过自定义 provider 指向了 MiMo / MiniMax / Kimi，按实际模型/provider 归类
+            // 若在 Codex 中通过自定义 provider 指向了 OpenCode Go / MiMo / MiniMax / Kimi，按实际模型/provider 归类
+            if isOpenCodeGo {
+                return .opencodeGo
+            }
             if p.contains("xiaomi") || p.contains("mimo") || m.contains("mimo") {
                 return .mimo
             }
@@ -128,6 +142,9 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
             return .minimax
         }
         if c == "mimocode" || c == "mimo" {
+            if isOpenCodeGo {
+                return .opencodeGo
+            }
             if p.contains("minimax") || m.contains("minimax") {
                 return .minimax
             }
@@ -137,7 +154,10 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
             return .mimo
         }
 
-        // 2. 跨客户端路由（如 Claude Code / OpenCode / CC Switch 中使用 MiniMax、MiMo、Kimi、Codex）
+        // 2. 跨客户端路由（注意 OpenCode Go 会托管 kimi-k2.5 / minimax-m2.5 等模型，必须先于按模型名匹配！）
+        if isOpenCodeGo {
+            return .opencodeGo
+        }
         if p.contains("minimax") || m.contains("minimax") {
             return .minimax
         }
