@@ -1,6 +1,6 @@
 # TokenUse
 
-macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code、MiniMax、Antigravity** 五大编程平台的**多账号在线套餐配额 + 官方多端计费分模型对账 + 本地会话 Token 融合统计**。
+macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code、MiniMax、Antigravity、OpenCode Go** 六大编程平台的**多账号在线套餐配额 + 官方多端计费分模型对账 + 本地会话 Token 融合统计**。
 
 [![Latest Release](https://img.shields.io/github/v/release/zhangsubo/token-use)](https://github.com/zhangsubo/token-use/releases/latest)
 [![Download](https://img.shields.io/github/downloads/zhangsubo/token-use/total)](https://github.com/zhangsubo/token-use/releases/latest)
@@ -8,18 +8,19 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ## 核心功能
 
-- **5 大平台 × 多账号配额 + 官方计费跨端对账**：
+- **6 大平台 × 多账号配额 + 官方计费跨端对账**：
   - **OpenAI Codex**：自动读取 `$CODEX_HOME` / `~/.codex`、托管备份目录与 CC Switch 多账号，支持**一键切换系统当前活跃 Codex 账号**（自动安全备份原 `auth.json`），并发拉取 `/wham/usage`（5h / 7d / Code Review 7d 实时配额与 Credits 余额）、`/wham/rate-limit-reset-credits`（**重置券逐张过期倒计时 + 距到期完整 48 小时自动发送 macOS 原生系统通知提醒账号与当前用量 %**）与 `/wham/usage/daily-token-usage-breakdown`（**近 30 天 Desktop / CLI / Web / VS Code / Code Review 跨端占比 + 分模型每日/30d Credits 明细**），兼容 API Key 组织账单查询，并支持解压扫描 `archived_sessions/*.jsonl.zst`
   - **Xiaomi MiMo Token Plan**：**零配置免登识别 Xiaomi MiMo 桌面端会话**自动换取控制台与桌面会员双票据（智能区分通行证过期与未开通套餐，并保留多账号隔离 WebView 登录），并发拉取月度/计划 Token Plan 额度、账户现金余额、桌面会员周限额，以及 `/api/v1/usage`、`/usage/token-plan/list`、`/usage/detail/list` **套餐内 + 按量计费分模型每日账单与联网搜索次数**（月初自动补查上月明细），合并去重 `mimocode.db` 与桌面端 Orca 数据库
   - **Moonshot Kimi Code**：兼容 OAuth、`sk-kimi-...` API Key、Moonshot 开放平台 `sk-...` Key 与 `kimi-auth` 网页会话多账号，自动扫描 `~/.kimi-code` 与 **Kimi Desktop（`daimon-share`）** 会话（过滤 `usageScope=session` 防双计），同时查询 `/coding/v1/usages`、`/coding/v1/models` 与 Web 多场景 `GetUsages`（5h 并发窗口、7d 周限额、**月度全站共享池 vs Coding 池跨场景差额**及已授权模型清单）
   - **MiniMax Token Plan / Coding Plan**：自动记忆国内（`minimaxi.com`）与国际版（`minimax.io`）可用站点，级联查询 `/v1/token_plan/remains`、Coding Plan **全量模型池（通用文本 / 语音 / 视频 / 图像 / 音乐）**、账户可用现金余额与 `/account/amount` **官方分模型计费 Token / 调用次数 / 扣费金额账单**，原生解析 MiniMax Code (`mcode`) `~/.minimax/v2/sessions` 与跨客户端日志
   - **Google Antigravity**：智能分级探测本机 `App / CLI / IDE` 实例 + 多份 Google OAuth 凭证刷新，结合 `RetrieveUserQuotaSummary`、`GetUserStatus` 与 CloudCode `fetchAvailableModels` 展示 Gemini / Argon / Claude-GPT **5h + 7d 分组配额池与全量云端模型实时余量**，并解码 `~/.gemini/antigravity*` Protobuf 会话记录
+  - **OpenCode Go**：自动识别 **OpenCode 2.x** `~/.local/share/opencode/opencode.db`（OAuth 控制台登录与 API Key）、`auth.json`、`opencode.json(c)` 及跨端配置，智能去重停用与遗留凭证，实时拉取 `/console/api/go/status` 与 `/zen/go/v1/usage`（**5h 滚动窗口 / 7d 周限额 / 月度额度微美分精度 `$已用 / $限额` 与重置倒计时**、套餐等级及按量余额），并精准归集 `opencode-go` 本地会话 Token
 - **跨设备云端计费摘要条 & 可展开分模型明细面板**：
   - 即使其他电脑、远端服务器、Web 端或 API 渠道产生了消耗而本机无日志，也能通过官方计费接口捕获；自动以 `max(本机今日, 官方云端今日)` 对账展示今日 Token（悬停可对照云端与本机今日明细，且不污染按缓存单价折算的本机等效价值）
   - 每个账号卡片内嵌**官方跨端计费摘要条**，点击即可展开**分模型用量与计费面板**，自动归并同一模型并标注 `官方云端`、`云端+本机`、`本机日志` 三类来源徽章
 - **可自由移动的毛玻璃环形侧边栏（Edge Dock）+ 实时活跃转圈**：
-  - 屏幕边缘停靠条实时展示今日总 Token 与 **5 大平台剩余配额环形仪表盘**（Antigravity 圆环精准对齐当前活跃 IDE 的 **Gemini 配额池**），悬停滑出面板、点击快速显隐、图钉一键常驻
-  - **防冲突自由定位（鼠标拖动 / 右键菜单 / 设置面板三端同步）**：支持直接用鼠标按住侧边栏**上下滑动**或跨屏拉动**磁吸贴靠屏幕左侧 / 右侧**（支持多显示器记忆，主面板跟随高度自动对齐），也可通过右键快捷菜单或在设置中通过快捷档位与无级滑块精确调节，彻底避免与其他边缘工具位置冲突
+  - 屏幕边缘停靠条实时展示今日总 Token 与 **6 大平台剩余配额环形仪表盘**（Antigravity 圆环精准对齐当前活跃 IDE 的 **Gemini 配额池**），悬停滑出面板、点击快速显隐、图钉一键常驻、面板右上角一键收回
+  - **防冲突自由定位（鼠标拖动 / 右键菜单 / 设置面板三端同步）**：支持直接用鼠标按住侧边栏**上下滑动**或跨屏拉动**磁吸贴靠屏幕左侧 / 右侧**（支持多显示器记忆，主面板跟随高度自动对齐），也可通过边缘展示条右键菜单快捷定位/退出，或在设置中通过快捷档位与无级滑块精确调节，彻底避免与其他边缘工具位置冲突
   - **会话运行实时感知**：轻量检测各平台本地活跃 Session，有会话正在生成时对应平台配额圆环切换为**流光旋转彗星环**（主面板同步显示「运行中」标签），会话单轮完成即自动增量刷新本地用量；空闲时零动画开销静止
 - **实测 `tok/s` 生成速率统计 & 2 列电池式配额卡片**：
   - 按各平台本地会话精确时间戳计算 `(输出 + 思考 Token) / 实测生成耗时`（自动剔除工具等待耗时），在平台标题栏、多账号卡片与展开明细中展示 **`⚡ tok/s` 平均速率与最近一轮速率**
@@ -41,7 +42,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ### 方式一：从 Release 下载（推荐）
 
-[下载最新版本 v1.3.3 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
+[下载最新版本 v1.4.0 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
 1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
 2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
@@ -70,7 +71,7 @@ TOKENUSE_DEBUG=1 swift run
 `build.sh` 支持注入版本号与构建号（CI 自动传入）：
 
 ```bash
-MARKETING_VERSION=1.3.3 BUILD_NUMBER=1 ./build.sh
+MARKETING_VERSION=1.4.0 BUILD_NUMBER=1 ./build.sh
 ```
 
 ## 项目结构
@@ -85,16 +86,16 @@ token-use/
     ├── EdgeWindowManager.swift                # 可拖动磁吸边缘停靠条（贴左/贴右/上下/多屏 + 活跃转圈）与 KeyablePanel
     ├── DebugLogger.swift                      # 按需调试日志（~/Library/Logs/TokenUse/）
     ├── Models/
-    │   ├── ProviderModels.swift               # 5 大平台品牌图标、tok/s 速率、重置券、云端计费与分模型快照模型
+    │   ├── ProviderModels.swift               # 6 大平台品牌图标、tok/s 速率、重置券、云端计费与分模型快照模型
     │   └── TokenData.swift                    # Token 聚合报表与货币/数字格式化工具
     ├── Services/
     │   ├── AccountDiscoveryService.swift      # 本机多客户端/桌面端凭证自动发现与去重
     │   ├── CodexAccountSwitchService.swift    # Codex ~/.codex/auth.json 安全备份与原子切换
     │   ├── MimoSessionMinter.swift            # 小米 MiMo 桌面端 SSO 免登换票服务
     │   ├── NativeUsageService.swift           # 单遍字节级极速本地扫描与实测 tok/s 速率提取
-    │   ├── ProviderQuotaService.swift         # 5 大平台在线配额、官方计费分模型明细与 OAuth 续期
+    │   ├── ProviderQuotaService.swift         # 6 大平台在线配额、官方计费分模型明细与 OAuth 续期
     │   ├── ResetCreditNotificationService.swift # ChatGPT 重置券 48 小时到期 macOS 原生系统通知服务
-    │   └── SessionActivityMonitor.swift       # 5 大平台本地活跃会话实时状态监测器
+    │   └── SessionActivityMonitor.swift       # 6 大平台本地活跃会话实时状态监测器
     ├── Settings/
     │   └── SettingsManager.swift              # 多账号配置、账号脱敏、重置券通知、侧边栏位置与平台排序持久化
     ├── Utilities/
@@ -102,7 +103,7 @@ token-use/
     │   ├── ReportManager.swift                # 汇总结果快照原子读写与自动清理（保留最近 5 份）
     │   └── ZstdDecompressor.swift             # 零链接依赖 libzstd / CLI 流式解压工具
     ├── Views/
-    │   ├── ContentView.swift                  # 5 大平台 × 多账号电池配额卡片、跨端计费条与分模型面板
+    │   ├── ContentView.swift                  # 6 大平台 × 多账号电池配额卡片、跨端计费条与分模型面板
     │   ├── SettingsView.swift                 # 多账号管理 + 隐私脱敏 + 到期通知 + 侧边栏调节 + 常规与更新页
     │   ├── XiaomiConsoleLoginSheet.swift      # 隔离会话的小米控制台 WebView 登录器
     │   ├── DonutChartView.swift               # Swift Charts 圆环图组件
@@ -112,7 +113,7 @@ token-use/
     │   └── Sparkle.strings                    # Sparkle 2.x 全套简体中文更新界面文案
     └── Resources/
         ├── AppIcon.icns                       # 应用图标
-        ├── provider-*.png                     # 5 大平台品牌图标资源
+        ├── provider-*.png                     # 6 大平台品牌图标资源
         └── working-mascot.png                 # 默认吉祥物图片
 ```
 
@@ -125,6 +126,7 @@ token-use/
 | **Kimi Code** | `~/.kimi-code`、`~/.kimi`、Kimi Desktop `daimon-share/**/wire.jsonl` | `/coding/v1/usages` + `/coding/v1/models` + Web 多场景 `GetUsages`（5h + 7d + 月度全站/Coding 池差额 + 授权模型） |
 | **MiniMax** | `~/.minimax/v2/sessions` (`mcode`)、`opencode.db`、`~/.claude/projects` | `/v1/token_plan/remains` + 全模型池 `/coding_plan/remains` + `/account/amount` 官方分模型账单与现金余额（CN & Global） |
 | **Antigravity** | `~/.gemini/antigravity*/conversations/*.db`（Protobuf）+ `transcript.jsonl` | `RetrieveUserQuotaSummary` + `GetUserStatus` + CloudCode `fetchAvailableModels`（5h/7d 配额池 + 全量云端模型实时余量） |
+| **OpenCode Go** | `~/.local/share/opencode/opencode.db`（`session_message` / `message`）+ `~/.claude/projects` | `/console/api/go/status` + `/zen/go/v1/usage` + `/console/api/billing/status`（5h / 7d / 月度微美分精度配额 + 按量余额） |
 
 ## 隐私与安全说明
 
@@ -140,7 +142,7 @@ token-use/
 ## 发布流程
 
 ```bash
-git tag v1.3.3
+git tag v1.4.0
 git push origin main --tags
 ```
 
