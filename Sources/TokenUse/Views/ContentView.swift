@@ -996,7 +996,7 @@ private struct AccountQuotaCard: View {
 
                 Spacer(minLength: 4)
 
-                if account.provider == .mimo && !account.hasCustomConsoleAuth && account.quotaWindows.isEmpty {
+                if account.provider == .mimo && !account.hasCustomConsoleAuth && account.quotaWindows.isEmpty && account.walletBalanceText == nil {
                     Button(action: onBindXiaomiCookie) {
                         HStack(spacing: 3) {
                             Image(systemName: "globe.badge.chevron.backward")

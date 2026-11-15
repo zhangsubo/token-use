@@ -531,7 +531,7 @@ enum AccountDiscoveryService {
                         origin: "OpenCode",
                         logPath: home.appendingPathComponent(".local/share/opencode").path
                     )
-                } else if lower.contains("xiaomi") || lower.contains("mimo") || key.hasPrefix("tp-") {
+                } else if lower.contains("xiaomi") || lower.contains("mimo") || key.hasPrefix("tp-") || key.hasPrefix("ttp-") {
                     appendKeyAccount(
                         provider: .mimo,
                         rawKey: key,
@@ -567,7 +567,7 @@ enum AccountDiscoveryService {
                         regionOrBaseURL: baseURL,
                         origin: "~/.claude"
                     )
-                } else if lowerURL.contains("xiaomimimo.com") || token.hasPrefix("tp-") {
+                } else if lowerURL.contains("xiaomimimo.com") || token.hasPrefix("tp-") || token.hasPrefix("ttp-") {
                     appendKeyAccount(
                         provider: .mimo,
                         rawKey: token,
@@ -624,7 +624,7 @@ enum AccountDiscoveryService {
                             origin: "CC Switch"
                         )
                     } else if icon == "xiaomi" || icon == "mimo" || codingPlanProvider == "xiaomi"
-                        || lowerURL.contains("xiaomimimo.com") || apiKey.hasPrefix("tp-") {
+                        || lowerURL.contains("xiaomimimo.com") || apiKey.hasPrefix("tp-") || apiKey.hasPrefix("ttp-") {
                         appendKeyAccount(
                             provider: .mimo,
                             rawKey: apiKey,
@@ -647,7 +647,18 @@ enum AccountDiscoveryService {
             }
         }
 
-        // E2) MiniMax 环境变量与 MiniMax Code 本地目录发现
+        // E2) MiniMax / MiMo 环境变量与 MiniMax Code 本地目录发现
+        if let envMimoKey = envMap["MIMO_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envMimoKey.isEmpty {
+            let mimoBaseHint = envMap["MIMO_BASE_URL"] ?? envMap["MIMO_API_BASE"]
+            appendKeyAccount(
+                provider: .mimo,
+                rawKey: envMimoKey,
+                label: "MiMo (ENV)",
+                regionOrBaseURL: mimoBaseHint,
+                origin: "ENV"
+            )
+        }
         if let envMinimaxKey = (envMap["MINIMAX_CODING_API_KEY"] ?? envMap["MINIMAX_API_KEY"])?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !envMinimaxKey.isEmpty {

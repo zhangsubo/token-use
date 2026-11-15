@@ -31,6 +31,8 @@ actor ProviderQuotaService {
     /// 内存缓存小米通行证换取的短期控制台 / 桌面会员 Cookie（遇 401/46109 自动清缓存重换一次）
     private var cachedMiMoConsoleSessions: [String: String] = [:]
     private var cachedMiMoMembershipSessions: [String: (cookie: String, region: String?)] = [:]
+    /// 记忆各 MiMo Token Plan 账号上次命中的区域网关（cn / sgp / ams）
+    private var cachedMiMoTokenPlanHost: [String: String] = [:]
     /// 记忆各 MiniMax 账号上次成功的域名（避免每次先撞错区域）
     private var cachedMiniMaxRegionHost: [String: String] = [:]
     /// 内存缓存从本机 Antigravity 二进制中动态解析出的 OAuth Client Secret
@@ -1276,13 +1278,37 @@ actor ProviderQuotaService {
         account: ProviderAccountConfig,
         ephemeralSecrets: [String: String]
     ) async -> ProviderQuotaResult {
-        // 1. 收集手动关联/保存的控制台 Cookie 与本机 Xiaomi MiMo.app 通行证 SSO Seed
-        let attachedCookie = KeychainStore.loadSecret(for: SettingsManager.cookieKeychainKey(for: account.id))
-        let directSecret = (account.authKind == .cookie)
-            ? (KeychainStore.loadSecret(for: account.id) ?? ephemeralSecrets[account.id])
-            : nil
-        let rawManualCookie = [attachedCookie, directSecret]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // 1. 收集 API Key（优先）与可选的控制台 Cookie / 本机 Xiaomi MiMo.app 通行证 SSO Seed
+        let primarySecret = (KeychainStore.loadSecret(for: account.id) ?? ephemeralSecrets[account.id])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachedCookie = KeychainStore.loadSecret(for: SettingsManager.cookieKeychainKey(for: account.id))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let looksLikeAPIKey: (String) -> Bool = { raw in
+            let lower = raw.lowercased()
+            guard !raw.contains("="), !raw.contains(";") else { return false }
+            return lower.hasPrefix("tp-") || lower.hasPrefix("ttp-") || lower.hasPrefix("sk-") || lower.hasPrefix("bearer ")
+        }
+
+        let activeAPIKey: String? = {
+            guard account.authKind != .localOnly else { return nil }
+            if account.authKind == .apiKey, let s = primarySecret, !s.isEmpty {
+                return s
+            }
+            if let s = primarySecret, !s.isEmpty, looksLikeAPIKey(s) {
+                return s
+            }
+            return nil
+        }()
+
+        let directCookieSecret: String? = {
+            guard account.authKind == .cookie, let s = primarySecret, !s.isEmpty, !looksLikeAPIKey(s) else {
+                return nil
+            }
+            return s
+        }()
+        let rawManualCookie = [attachedCookie, directCookieSecret]
+            .compactMap { $0 }
             .first { !$0.isEmpty }
 
         let desktopSeedRaw = ephemeralSecrets["\(account.id).xiaomi_account"]
@@ -1291,13 +1317,13 @@ actor ProviderQuotaService {
         let seedCacheKey = accountSeed.map { "mimo_seed:\($0.userId)" } ?? account.id
 
         let directConsoleCookie = rawManualCookie.flatMap { normalizeMiMoConsoleCookie($0, fallbackUserId: account.externalAccountId) }
-        let hasAnyAuth = (directConsoleCookie != nil) || (accountSeed != nil)
+        let hasAnyAuth = (activeAPIKey != nil) || (directConsoleCookie != nil) || (accountSeed != nil)
 
         guard hasAnyAuth else {
             return ProviderQuotaResult(
                 planBadge: "Token Plan",
                 windows: [],
-                statusMessage: "本地 Token 统计已启用 · 登录 Xiaomi MiMo 桌面端或在设置中登录小米控制台可查看套餐进度条",
+                statusMessage: "本地 Token 统计已启用 · 配置 MiMo API Key (tp-/sk-) 或登录桌面端可查看套餐进度与余额",
                 hasCustomConsoleAuth: false
             )
         }
@@ -1307,60 +1333,98 @@ actor ProviderQuotaService {
         var walletBalanceText: String? = nil
         var resolvedLabel: String? = nil
         var cloudBilling: CloudBillingSummary? = nil
+        var openAPIError: String? = nil
         var consoleError: String? = nil
         var didMintConsoleFail = false
 
-        // 2. 开放平台控制台查询（支持直接 Cookie 或由 passToken 无感换取，401/46109 自动重换一次）
-        do {
-            var activeConsoleCookie = directConsoleCookie ?? cachedMiMoConsoleSessions[seedCacheKey]
-            if activeConsoleCookie == nil, let seed = accountSeed {
-                if let minted = await MimoSessionMinter.mintConsoleSession(seed: seed)?.cookieHeader {
-                    cachedMiMoConsoleSessions[seedCacheKey] = minted
-                    activeConsoleCookie = minted
-                } else {
-                    didMintConsoleFail = true
-                }
-            }
-
-            if let initialCookie = activeConsoleCookie {
-                let snapshot: MiMoConsolePayload
-                do {
-                    snapshot = try await loadMiMoConsolePayload(cookie: initialCookie)
-                } catch QuotaError.authFailed(let msg) where accountSeed != nil {
-                    cachedMiMoConsoleSessions.removeValue(forKey: seedCacheKey)
-                    guard let reminted = await MimoSessionMinter.mintConsoleSession(seed: accountSeed!)?.cookieHeader else {
-                        throw QuotaError.authFailed(msg)
-                    }
-                    cachedMiMoConsoleSessions[seedCacheKey] = reminted
-                    snapshot = try await loadMiMoConsolePayload(cookie: reminted)
-                }
-
-                if let nick = snapshot.nickName, !nick.isEmpty {
-                    resolvedLabel = nick
-                } else if let email = snapshot.email, !email.isEmpty {
-                    resolvedLabel = email
-                }
-
-                if let bal = snapshot.balanceAmount {
-                    let symbol = (snapshot.currency == "USD") ? "$" : "¥"
+        // 2A. 官方 OpenAPI 主通道（BaseURL + API Key：tp- 查 /v1/platform/token_plan，sk- 查 /v1/platform/balance + /usage/daily）
+        if let apiKey = activeAPIKey {
+            do {
+                let apiSnapshot = try await loadMiMoOpenAPIPayload(
+                    apiKey: apiKey,
+                    baseHint: account.regionOrBaseURL,
+                    accountId: account.id
+                )
+                if let bal = apiSnapshot.balanceAmount {
+                    let symbol = (apiSnapshot.currency == "USD") ? "$" : "¥"
                     walletBalanceText = String(format: "余额 %@%.2f", symbol, bal)
                 }
-                cloudBilling = snapshot.cloudBilling
+                cloudBilling = apiSnapshot.cloudBilling
 
-                if snapshot.hasActivePlan, let pWin = snapshot.planWindow {
+                if apiSnapshot.hasActivePlan, let pWin = apiSnapshot.planWindow {
                     windows.append(pWin)
-                    if let compWin = snapshot.compensationWindow {
-                        windows.append(compWin)
-                    }
-                    planBadge = snapshot.planLabel ?? "Token Plan"
-                } else if snapshot.isExpiredPlan {
-                    planBadge = "\(snapshot.planLabel ?? "Token Plan") (已到期)"
-                } else if snapshot.balanceAmount != nil {
+                    planBadge = apiSnapshot.planLabel ?? "Token Plan"
+                } else if apiSnapshot.isExpiredPlan {
+                    planBadge = "\(apiSnapshot.planLabel ?? "Token Plan") (已到期)"
+                } else if apiSnapshot.balanceAmount != nil {
                     planBadge = "按量计费"
                 }
+            } catch {
+                openAPIError = error.localizedDescription
             }
-        } catch {
-            consoleError = error.localizedDescription
+        }
+
+        // 2B. 开放平台控制台可选增强（补齐昵称、tp- 套餐内分模型明细与现金余额，或作为纯 Cookie/桌面端账号主查询）
+        if directConsoleCookie != nil || accountSeed != nil {
+            do {
+                var activeConsoleCookie = directConsoleCookie ?? cachedMiMoConsoleSessions[seedCacheKey]
+                if activeConsoleCookie == nil, let seed = accountSeed {
+                    if let minted = await MimoSessionMinter.mintConsoleSession(seed: seed)?.cookieHeader {
+                        cachedMiMoConsoleSessions[seedCacheKey] = minted
+                        activeConsoleCookie = minted
+                    } else {
+                        didMintConsoleFail = true
+                    }
+                }
+
+                if let initialCookie = activeConsoleCookie {
+                    let snapshot: MiMoConsolePayload
+                    do {
+                        snapshot = try await loadMiMoConsolePayload(cookie: initialCookie)
+                    } catch QuotaError.authFailed(let msg) where accountSeed != nil {
+                        cachedMiMoConsoleSessions.removeValue(forKey: seedCacheKey)
+                        guard let reminted = await MimoSessionMinter.mintConsoleSession(seed: accountSeed!)?.cookieHeader else {
+                            throw QuotaError.authFailed(msg)
+                        }
+                        cachedMiMoConsoleSessions[seedCacheKey] = reminted
+                        snapshot = try await loadMiMoConsolePayload(cookie: reminted)
+                    }
+
+                    if resolvedLabel == nil {
+                        if let nick = snapshot.nickName, !nick.isEmpty {
+                            resolvedLabel = nick
+                        } else if let email = snapshot.email, !email.isEmpty {
+                            resolvedLabel = email
+                        }
+                    }
+
+                    if walletBalanceText == nil, let bal = snapshot.balanceAmount {
+                        let symbol = (snapshot.currency == "USD") ? "$" : "¥"
+                        walletBalanceText = String(format: "余额 %@%.2f", symbol, bal)
+                    }
+                    if cloudBilling == nil {
+                        cloudBilling = snapshot.cloudBilling
+                    }
+
+                    if windows.isEmpty {
+                        if snapshot.hasActivePlan, let pWin = snapshot.planWindow {
+                            windows.append(pWin)
+                            if let compWin = snapshot.compensationWindow {
+                                windows.append(compWin)
+                            }
+                            if planBadge == nil || planBadge == "按量计费" {
+                                planBadge = snapshot.planLabel ?? "Token Plan"
+                            }
+                        } else if snapshot.isExpiredPlan, planBadge == nil {
+                            planBadge = "\(snapshot.planLabel ?? "Token Plan") (已到期)"
+                        } else if snapshot.balanceAmount != nil, planBadge == nil {
+                            planBadge = "按量计费"
+                        }
+                    }
+                }
+            } catch {
+                consoleError = error.localizedDescription
+            }
         }
 
         // 3. Xiaomi MiMo 桌面端会员周额度查询（若存在通行证 passToken Seed）
@@ -1375,20 +1439,21 @@ actor ProviderQuotaService {
             }
         }
 
-        let hasCustomAuth = (rawManualCookie != nil)
-        if windows.isEmpty && walletBalanceText == nil && cloudBilling == nil, let consoleError {
+        let hasCustomAuth = (activeAPIKey != nil) || (rawManualCookie != nil)
+        if windows.isEmpty && walletBalanceText == nil && cloudBilling == nil,
+           let primaryErr = openAPIError ?? consoleError {
             return ProviderQuotaResult(
                 resolvedLabel: resolvedLabel,
                 planBadge: planBadge ?? "MiMo",
-                errorMessage: "小米套餐查询失败: \(consoleError)",
+                errorMessage: "小米套餐查询失败: \(primaryErr)",
                 hasCustomConsoleAuth: hasCustomAuth
             )
         }
 
         let statusMsg: String? = {
             guard windows.isEmpty else { return nil }
-            if didMintConsoleFail && walletBalanceText == nil && cloudBilling == nil {
-                return "小米通行证会话已过期 · 请打开 Xiaomi MiMo 桌面端或在设置中登录小米控制台以同步官方套餐与计费明细"
+            if activeAPIKey == nil && didMintConsoleFail && walletBalanceText == nil && cloudBilling == nil {
+                return "小米通行证会话已过期 · 请配置 MiMo API Key、打开桌面端或在设置中登录控制台"
             }
             return walletBalanceText != nil
                 ? "当前未开通活跃套餐 · 已同步开放平台余额"
@@ -1404,6 +1469,423 @@ actor ProviderQuotaService {
             statusMessage: statusMsg,
             hasCustomConsoleAuth: hasCustomAuth
         )
+    }
+
+    // MARK: - MiMo OpenAPI (BaseURL + API Key, V2.2.0+)
+
+    private func loadMiMoOpenAPIPayload(
+        apiKey: String,
+        baseHint: String?,
+        accountId: String
+    ) async throws -> MiMoConsolePayload {
+        var cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanKey.lowercased().hasPrefix("bearer ") {
+            cleanKey = String(cleanKey.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !cleanKey.isEmpty else {
+            throw QuotaError.missingCredential("未配置 MiMo API Key")
+        }
+
+        let lowerKey = cleanKey.lowercased()
+        let lowerBase = (baseHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefersTokenPlan = lowerKey.hasPrefix("tp-") || lowerKey.hasPrefix("ttp-") || lowerBase.contains("token-plan-")
+        let prefersStandard = lowerKey.hasPrefix("sk-")
+
+        if prefersTokenPlan {
+            return try await fetchMiMoTokenPlanOpenAPI(apiKey: cleanKey, baseHint: baseHint, accountId: accountId)
+        }
+        if prefersStandard {
+            return try await fetchMiMoStandardOpenAPI(apiKey: cleanKey, baseHint: baseHint)
+        }
+
+        do {
+            return try await fetchMiMoTokenPlanOpenAPI(apiKey: cleanKey, baseHint: baseHint, accountId: accountId)
+        } catch {
+            return try await fetchMiMoStandardOpenAPI(apiKey: cleanKey, baseHint: baseHint)
+        }
+    }
+
+    private func fetchMiMoTokenPlanOpenAPI(
+        apiKey: String,
+        baseHint: String?,
+        accountId: String
+    ) async throws -> MiMoConsolePayload {
+        let defaultHosts = [
+            "https://token-plan-cn.xiaomimimo.com",
+            "https://token-plan-sgp.xiaomimimo.com",
+            "https://token-plan-ams.xiaomimimo.com",
+        ]
+        let hosts = resolveMiMoTokenPlanHosts(baseHint: baseHint, accountId: accountId, defaultHosts: defaultHosts)
+        var lastError: Error = QuotaError.invalidResponse("MiMo Token Plan 接口不可达")
+
+        for host in hosts {
+            do {
+                let data = try await fetchMiMoOpenAPIData(urlString: "\(host)/v1/platform/token_plan", apiKey: apiKey)
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw QuotaError.invalidResponse("MiMo token_plan 响应解析失败")
+                }
+                if defaultHosts.contains(host) {
+                    cachedMiMoTokenPlanHost[accountId] = host
+                }
+
+                let now = Date()
+                let body = (json["data"] as? [String: Any]) ?? json
+                var out = MiMoConsolePayload()
+
+                let rawCode = ((body["plan_code"] as? String) ?? (body["planCode"] as? String))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let normCode = rawCode.lowercased()
+                    .replacingOccurrences(of: " ", with: "_")
+                    .replacingOccurrences(of: "-", with: "_")
+                let isNoPlan = Self.mimoNoPlanCodes.contains(normCode)
+                if !normCode.isEmpty && !isNoPlan {
+                    out.planLabel = formatMiMoPlanCode(rawCode)
+                }
+
+                let period = body["period"] as? [String: Any]
+                let startAt = parseMiMoOpenAPIUTCDate(period?["start_at"] ?? period?["startAt"])
+                let endAt = parseMiMoOpenAPIUTCDate(period?["end_at"] ?? period?["endAt"])
+                let isExpired = endAt.map { $0 <= now } ?? false
+
+                let quota = body["quota"] as? [String: Any]
+                let total = optionalDoubleValue(quota?["total_credits"] ?? quota?["totalCredits"])
+                let used = optionalDoubleValue(quota?["used_credits"] ?? quota?["usedCredits"])
+                let remaining = optionalDoubleValue(quota?["remaining_credits"] ?? quota?["remainingCredits"])
+
+                if !isNoPlan && !isExpired, let total, total > 0 {
+                    let effectiveUsed = used ?? max(0.0, total - (remaining ?? total))
+                    let usedPct = min(100.0, max(0.0, (effectiveUsed / total) * 100.0))
+                    let isLongCycle = (startAt != nil && endAt != nil && endAt!.timeIntervalSince(startAt!) > 45 * 86400)
+                    out.hasActivePlan = true
+                    out.planWindow = QuotaWindow(
+                        id: "mimo.plan_total",
+                        label: isLongCycle ? "套餐总额度" : "月度套餐额度",
+                        usedPercent: usedPct,
+                        detailText: "\(NumberFormatterUtil.formatCompact(Int(effectiveUsed))) / \(NumberFormatterUtil.formatCompact(Int(total)))",
+                        resetAt: endAt
+                    )
+                } else if !isNoPlan && isExpired {
+                    out.isExpiredPlan = true
+                }
+                return out
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        throw lastError
+    }
+
+    private func fetchMiMoStandardOpenAPI(
+        apiKey: String,
+        baseHint: String?
+    ) async throws -> MiMoConsolePayload {
+        let base = resolveMiMoStandardAPIBase(baseHint)
+        let now = Date()
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        let comps = utcCal.dateComponents([.year, .month, .day], from: now)
+        let curYear = comps.year ?? 2026
+        let curMonth = comps.month ?? 1
+        let curStart = String(format: "%04d-%02d-01", curYear, curMonth)
+        let todayUTC = utcDateString(from: now)
+
+        async let balTask = fetchMiMoOpenAPIData(urlString: "\(base)/v1/platform/balance", apiKey: apiKey)
+        async let usageTask = try? fetchMiMoOpenAPIData(
+            urlString: "\(base)/v1/platform/usage/daily?start_date=\(curStart)&end_date=\(todayUTC)",
+            apiKey: apiKey
+        )
+
+        let balData = try await balTask
+        let usageDataRaw = await usageTask
+
+        guard let balJSON = try? JSONSerialization.jsonObject(with: balData) as? [String: Any] else {
+            throw QuotaError.invalidResponse("MiMo OpenAPI balance 响应解析失败")
+        }
+
+        var out = MiMoConsolePayload()
+        let infos = (balJSON["balance_infos"] as? [[String: Any]])
+            ?? ((balJSON["data"] as? [String: Any])?["balance_infos"] as? [[String: Any]])
+            ?? []
+        let balInfo = infos.first ?? (balJSON["data"] as? [String: Any]) ?? balJSON
+
+        if let cur = (balInfo["currency"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+           !cur.isEmpty {
+            out.currency = cur
+        }
+        let cashBal = optionalDoubleValue(balInfo["cash_balance"])
+        let giftBal = optionalDoubleValue(balInfo["gift_balance"])
+        if let totalAvail = optionalDoubleValue(balInfo["total_available"] ?? balInfo["balance"])
+            ?? ((cashBal != nil || giftBal != nil) ? ((cashBal ?? 0) + (giftBal ?? 0)) : nil) {
+            out.balanceAmount = totalAvail
+        }
+
+        var usageRows = extractMiMoUsageRows(from: usageDataRaw)
+        var monthTag = "本月"
+        if usageRows.isEmpty, (comps.day ?? 1) <= 3 {
+            let prevYear = (curMonth == 1) ? (curYear - 1) : curYear
+            let prevMonth = (curMonth == 1) ? 12 : (curMonth - 1)
+            if prevYear > 2026 || (prevYear == 2026 && prevMonth >= 9),
+               let prevStartDate = utcCal.date(from: DateComponents(year: prevYear, month: prevMonth, day: 1)),
+               let prevRange = utcCal.range(of: .day, in: .month, for: prevStartDate) {
+                let pStart = String(format: "%04d-%02d-01", prevYear, prevMonth)
+                let pEnd = String(format: "%04d-%02d-%02d", prevYear, prevMonth, prevRange.count)
+                if let prevData = try? await fetchMiMoOpenAPIData(
+                    urlString: "\(base)/v1/platform/usage/daily?start_date=\(pStart)&end_date=\(pEnd)",
+                    apiKey: apiKey
+                ) {
+                    let prevRows = extractMiMoUsageRows(from: prevData)
+                    if !prevRows.isEmpty {
+                        usageRows = prevRows
+                        monthTag = "上月"
+                    }
+                }
+            }
+        }
+
+        out.cloudBilling = buildMiMoOpenAPICloudBilling(
+            rows: usageRows,
+            monthTag: monthTag,
+            currency: out.currency,
+            cashBalance: cashBal,
+            giftBalance: giftBal,
+            todayUTC: todayUTC
+        )
+        return out
+    }
+
+    private func buildMiMoOpenAPICloudBilling(
+        rows: [[String: Any]],
+        monthTag: String,
+        currency: String,
+        cashBalance: Double?,
+        giftBalance: Double?,
+        todayUTC: String
+    ) -> CloudBillingSummary? {
+        let sym = (currency == "USD") ? "$" : "¥"
+
+        struct Acc {
+            var modelName: String
+            var todayTokens: Int = 0
+            var periodTokens: Int = 0
+            var requests: Int = 0
+            var spend: Double = 0.0
+        }
+
+        var byModel: [String: Acc] = [:]
+        var todayTokens = 0
+        var todayReqs = 0
+        var todaySpend = 0.0
+        var periodTokens = 0
+        var periodReqs = 0
+        var periodSpend = 0.0
+        var webSearchReqs = 0
+
+        for row in rows {
+            let rType = ((row["resource_type"] as? String) ?? "model").lowercased()
+            let name = ((row["name"] as? String) ?? (row["model"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let dateStr = String(((row["date"] as? String) ?? "").prefix(10))
+            let reqs = intValue(row["request_count"] ?? row["requestCount"])
+            let spend = optionalDoubleValue(row["consumed_amount"] ?? row["consumedAmount"]) ?? 0.0
+
+            if rType == "plugin" {
+                if name.lowercased().contains("search") {
+                    webSearchReqs += reqs
+                }
+                periodReqs += reqs
+                periodSpend += spend
+                if dateStr == todayUTC {
+                    todayReqs += reqs
+                    todaySpend += spend
+                }
+                continue
+            }
+
+            guard !name.isEmpty else { continue }
+            let tok = max(
+                intValue(row["total_tokens"] ?? row["totalToken"]),
+                intValue(row["input_cache_hit_tokens"]) + intValue(row["input_cache_miss_tokens"]) + intValue(row["output_tokens"])
+            )
+            let key = name.lowercased()
+            var acc = byModel[key] ?? Acc(modelName: name)
+            acc.periodTokens += tok
+            acc.requests += reqs
+            acc.spend += spend
+            periodTokens += tok
+            periodReqs += reqs
+            periodSpend += spend
+            if dateStr == todayUTC {
+                acc.todayTokens += tok
+                todayTokens += tok
+                todayReqs += reqs
+                todaySpend += spend
+            }
+            byModel[key] = acc
+        }
+
+        let sorted = byModel.sorted { lhs, rhs in
+            if lhs.value.periodTokens != rhs.value.periodTokens {
+                return lhs.value.periodTokens > rhs.value.periodTokens
+            }
+            return lhs.value.requests > rhs.value.requests
+        }
+        let modelItems: [ModelUsageItem] = sorted.map { (key, acc) in
+            ModelUsageItem(
+                id: "mimo.model.\(key)",
+                modelName: acc.modelName,
+                origin: .officialCloud,
+                matchKey: key,
+                cloudTodayTokens: acc.todayTokens > 0 ? acc.todayTokens : nil,
+                cloudPeriodTokens: acc.periodTokens > 0 ? acc.periodTokens : nil,
+                cloudPeriodLabel: acc.periodTokens > 0 ? monthTag : nil,
+                cloudRequests: acc.requests > 0 ? acc.requests : nil,
+                cloudSpendText: acc.spend > 0.0001 ? formatMoneyText(acc.spend, symbol: sym) : nil
+            )
+        }
+
+        var surfaceParts: [String] = []
+        if let gift = giftBalance, gift > 0.005 {
+            surfaceParts.append(String(format: "现金 %@%.2f · 赠金 %@%.2f", sym, cashBalance ?? 0, sym, gift))
+        }
+        if webSearchReqs > 0 {
+            surfaceParts.append("联网搜索 \(webSearchReqs) 次")
+        }
+        let surfaceSummary = surfaceParts.isEmpty ? nil : surfaceParts.joined(separator: " · ")
+
+        guard !modelItems.isEmpty || periodTokens > 0 || periodSpend > 0.0001 || surfaceSummary != nil else {
+            return nil
+        }
+
+        return CloudBillingSummary(
+            sourceName: "小米官方计费",
+            todayTokens: todayTokens > 0 ? todayTokens : nil,
+            todayRequests: todayReqs > 0 ? todayReqs : nil,
+            todaySpendText: todaySpend > 0.0001 ? formatMoneyText(todaySpend, symbol: sym) : nil,
+            periodLabel: periodTokens > 0 ? "\(monthTag)云端" : nil,
+            periodTokens: periodTokens > 0 ? periodTokens : nil,
+            periodRequests: periodReqs > 0 ? periodReqs : nil,
+            periodSpendText: periodSpend > 0.0001 ? formatMoneyText(periodSpend, symbol: sym) : nil,
+            surfaceSummary: surfaceSummary,
+            models: modelItems
+        )
+    }
+
+    private func fetchMiMoOpenAPIData(urlString: String, apiKey: String) async throws -> Data {
+        guard let url = URL(string: urlString) else {
+            throw QuotaError.invalidResponse("MiMo 接口地址无效")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 401 || status == 403 {
+            let errMsg = ((try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? [String: Any])?["message"] as? String
+            throw QuotaError.authFailed(errMsg ?? "MiMo API Key 鉴权失败 (HTTP \(status))")
+        }
+        guard (200..<300).contains(status) else {
+            throw QuotaError.invalidResponse("MiMo OpenAPI 返回 HTTP \(status)")
+        }
+        return data
+    }
+
+    private func resolveMiMoTokenPlanHosts(
+        baseHint: String?,
+        accountId: String,
+        defaultHosts: [String]
+    ) -> [String] {
+        let trimmed = (baseHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+            let stripped = stripMiMoInferenceSuffix(trimmed)
+            let host = URL(string: stripped)?.host?.lowercased() ?? ""
+            if !host.isEmpty,
+               host != "api.xiaomimimo.com",
+               host != "platform.xiaomimimo.com",
+               host != "mimo.mi.com" {
+                return [stripped]
+            }
+        } else if lower == "cn" {
+            return ["https://token-plan-cn.xiaomimimo.com"]
+        } else if lower == "sg" || lower == "sgp" || lower == "global" || lower == "intl" {
+            return ["https://token-plan-sgp.xiaomimimo.com", "https://token-plan-ams.xiaomimimo.com"]
+        } else if lower == "ams" || lower == "eu" {
+            return ["https://token-plan-ams.xiaomimimo.com"]
+        }
+
+        if let remembered = cachedMiMoTokenPlanHost[accountId], defaultHosts.contains(remembered) {
+            return [remembered] + defaultHosts.filter { $0 != remembered }
+        }
+        return defaultHosts
+    }
+
+    private func resolveMiMoStandardAPIBase(_ baseHint: String?) -> String {
+        let trimmed = (baseHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+            let stripped = stripMiMoInferenceSuffix(trimmed)
+            let host = URL(string: stripped)?.host?.lowercased() ?? ""
+            if !host.isEmpty,
+               !host.hasPrefix("token-plan-"),
+               host != "platform.xiaomimimo.com",
+               host != "mimo.mi.com" {
+                return stripped
+            }
+        }
+        return "https://api.xiaomimimo.com"
+    }
+
+    private func stripMiMoInferenceSuffix(_ rawURL: String) -> String {
+        var out = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while out.hasSuffix("/") { out.removeLast() }
+        for suffix in ["/anthropic/v1", "/anthropic", "/v1/chat/completions", "/v1/messages", "/v1"] {
+            if out.lowercased().hasSuffix(suffix) {
+                out = String(out.dropLast(suffix.count))
+                break
+            }
+        }
+        while out.hasSuffix("/") { out.removeLast() }
+        return out
+    }
+
+    private func formatMiMoPlanCode(_ rawCode: String) -> String {
+        switch rawCode.lowercased() {
+        case "lite": return "Token Plan · Lite"
+        case "standard": return "Token Plan · Standard"
+        case "pro": return "Token Plan · Pro"
+        case "max": return "Token Plan · Max"
+        default:
+            return rawCode.lowercased().contains("plan") ? rawCode : "Token Plan · \(rawCode)"
+        }
+    }
+
+    /// 解析 MiMo OpenAPI 的 UTC 时间字符串（文档格式为无时区 UTC `"YYYY-MM-DD HH:mm:ss"`）
+    private func parseMiMoOpenAPIUTCDate(_ any: Any?) -> Date? {
+        guard let any else { return nil }
+        if let str = any as? String {
+            let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: ": ", with: ":")
+            if trimmed.isEmpty { return nil }
+            if let num = Double(trimmed), num > 0 {
+                return Date(timeIntervalSince1970: num > 1_000_000_000_000 ? num / 1000.0 : num)
+            }
+            let normalized = trimmed.replacingOccurrences(of: " ", with: "T")
+            let hasExplicitTZ = normalized.hasSuffix("Z")
+                || normalized.hasSuffix("z")
+                || normalized.dropFirst(10).contains("+")
+                || normalized.dropFirst(10).contains("-")
+            if hasExplicitTZ {
+                return FastDateParser.parseISO8601(normalized)
+            }
+            return FastDateParser.parseISO8601(normalized + "Z")
+        }
+        let num = doubleValue(any)
+        guard num > 0 else { return nil }
+        return Date(timeIntervalSince1970: num > 1_000_000_000_000 ? num / 1000.0 : num)
     }
 
     private struct MiMoConsolePayload {

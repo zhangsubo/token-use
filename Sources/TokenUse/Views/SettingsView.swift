@@ -489,7 +489,7 @@ struct SettingsView: View {
                 .disabled(appState.switchingAccountId != nil)
             }
 
-            if account.provider == .mimo {
+            if account.provider == .mimo && (account.authKind != .apiKey || hasCookie) {
                 Button {
                     xiaomiLoginTarget = account
                 } label: {
@@ -1157,7 +1157,7 @@ private struct AccountEditorSheet: View {
                 if provider == .mimo {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text("小米控制台会话 Cookie（已装 MiMo 桌面端可自动免登，多账号可单独登录）")
+                            Text("小米控制台 Cookie（可选增强：补充分模型明细与现金余额）")
                                 .font(.system(size: 11.5, weight: .medium))
                             Spacer()
                             Button("打开网页登录自动获取") {
@@ -1240,6 +1240,8 @@ private struct AccountEditorSheet: View {
             return "粘贴 OpenCode OAuth JSON（含 access 与 orgID）或访问令牌（存入 Keychain）"
         case (.opencodeGo, .apiKey):
             return "粘贴 OpenCode Go API Key（安全存入 macOS Keychain，留空则保持原值）"
+        case (.mimo, .apiKey):
+            return "粘贴 MiMo Token Plan (tp-...) 或按量 API Key (sk-...)（存入 Keychain，留空则保持原值）"
         default:
             return "API Key / Token（安全存入 macOS Keychain，留空则保持原值）"
         }
@@ -1248,7 +1250,7 @@ private struct AccountEditorSheet: View {
     private static func recommendedAuthKind(for provider: TrackedProvider) -> AccountAuthKind {
         switch provider {
         case .codex: return .oauthToken
-        case .mimo: return .cookie
+        case .mimo: return .apiKey
         case .kimi: return .apiKey
         case .minimax: return .apiKey
         case .antigravity: return .oauthToken

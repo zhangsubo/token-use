@@ -85,7 +85,7 @@ enum TrackedProvider: String, CaseIterable, Codable, Sendable, Identifiable {
         case .codex:
             return "支持 ChatGPT OAuth JSON / refresh_token，自动读取 ~/.codex 与 CC Switch 多账号并支持一键切换"
         case .mimo:
-            return "自动识别 Xiaomi MiMo 桌面端会话免登录拉取 Token Plan 与会员周额度，亦支持网页登录多账号"
+            return "支持 tp-... Token Plan Key 与 sk-... 按量 API Key（自动适配 BaseURL），兼容 MiMo 桌面端免登录与控制台多账号"
         case .kimi:
             return "支持 sk-kimi-... API Key、OAuth 凭证或 kimi-auth 网页会话（自动读取 ~/.kimi-code / Kimi 桌面端）"
         case .minimax:
