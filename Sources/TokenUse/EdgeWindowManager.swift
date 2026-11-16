@@ -44,6 +44,7 @@ enum DockEdge: String, Codable, CaseIterable, Identifiable, Sendable {
 final class TriggerState: ObservableObject {
     static let shared = TriggerState()
     @Published var isHovered = false
+    @Published var isExpanded = false
     @Published var isDragging = false
     @Published var activeEdge: DockEdge = .right
     private init() {}
@@ -129,7 +130,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private var triggerView: NSWindow?
     private var isVisible = false
     private var edge: DockEdge = .right
-    private let triggerWidth: CGFloat = 50
+    private var triggerWidth: CGFloat { TriggerState.shared.isExpanded ? 50 : 8 }
     private let triggerHeight: CGFloat = 274
     private let verticalMargin: CGFloat = 8
     private let magneticSnapDistance: CGFloat = 96
@@ -603,6 +604,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         cancelHideTimer()
         guard !isDraggingDock else { return }
         guard !isVisible else { return }
+        setDockExpanded(true)
         positionPanelHidden()
         isVisible = true
 
@@ -617,12 +619,17 @@ final class EdgeWindowManager: NSObject, ObservableObject {
 
     func hidePanel() {
         cancelShowTimer()
-        guard isVisible, !isPinned, !isModalPresenting, !isDraggingDock else { return }
-
-        hideTimer?.invalidate()
+        guard !isPinned, !isModalPresenting, !isDraggingDock else { return }
+        guard isVisible else {
+            setDockExpanded(false)
+            return
+        }
+        // Keep the original deadline while the pointer continues moving outside.
+        guard hideTimer == nil else { return }
         hideTimer = Timer.scheduledTimer(withTimeInterval: hideDelay, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                self.hideTimer = nil
                 self.performHide()
             }
         }
@@ -648,6 +655,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private func performHide() {
         guard isVisible, !isPinned, !isModalPresenting, !isDraggingDock else { return }
         isVisible = false
+        setDockExpanded(false)
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.2
@@ -655,9 +663,16 @@ final class EdgeWindowManager: NSObject, ObservableObject {
             positionPanelHidden()
         } completionHandler: { [weak self] in
             Task { @MainActor in
-                self?.window?.orderOut(nil)
+                guard let self, !self.isVisible else { return }
+                self.window?.orderOut(nil)
             }
         }
+    }
+
+    private func setDockExpanded(_ expanded: Bool) {
+        guard TriggerState.shared.isExpanded != expanded else { return }
+        TriggerState.shared.isExpanded = expanded
+        repositionTriggerWindow()
     }
 
     // MARK: - Screen, Settings & Mouse Monitoring
@@ -799,6 +814,24 @@ struct TriggerIndicator: View {
     @StateObject private var appState = AppState.shared
 
     var body: some View {
+        ZStack {
+            if !state.isExpanded {
+                let isVertical = DockEdge.horizontalEdges.contains(state.activeEdge)
+                let collapsedLength: CGFloat = 262 * 3 / 8
+                Capsule()
+                    .fill(Color(.sRGB, red: 0.16, green: 0.20, blue: 0.28)
+                        .opacity(state.isHovered ? 0.96 : 0.85))
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
+                    .frame(width: isVertical ? 4 : collapsedLength, height: isVertical ? collapsedLength : 4)
+            } else {
+                expandedDock
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .help("悬停展开 · 按住拖动位置 · 右键快捷定位或退出")
+    }
+
+    private var expandedDock: some View {
         ZStack {
             switch state.activeEdge {
             case .right:
