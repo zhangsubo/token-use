@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ServiceManagement
 
 @MainActor
 final class SettingsManager: ObservableObject {
@@ -512,5 +513,91 @@ final class SettingsManager: ObservableObject {
             notifiedResetCreditIDList.removeFirst(notifiedResetCreditIDList.count - 250)
         }
         defaults.set(notifiedResetCreditIDList, forKey: Keys.notifiedResetCreditIDs)
+    }
+}
+
+@MainActor
+final class LaunchAtLoginManager: NSObject, ObservableObject {
+    static let shared = LaunchAtLoginManager()
+
+    static var isSupportedBundle: Bool {
+        Bundle.main.bundleIdentifier != nil
+            && Bundle.main.bundleURL.pathExtension.lowercased() == "app"
+    }
+
+    @Published private(set) var status: SMAppService.Status
+    @Published private(set) var errorMessage: String?
+
+    var isActive: Bool {
+        status == .enabled || status == .requiresApproval
+    }
+
+    private override init() {
+        self.status = Self.isSupportedBundle ? SMAppService.mainApp.status : .notFound
+        super.init()
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                LaunchAtLoginManager.shared.refresh()
+            }
+        }
+    }
+
+    func refresh() {
+        status = Self.isSupportedBundle ? SMAppService.mainApp.status : .notFound
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard Self.isSupportedBundle else { return }
+        errorMessage = nil
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else {
+                if SMAppService.mainApp.status != .notRegistered {
+                    try SMAppService.mainApp.unregister()
+                }
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            DebugLogger.log("❌ [LaunchAtLogin] 设置开机自启失败(\(enabled)): \(error)")
+        }
+        refresh()
+    }
+
+    func openSystemLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    @objc func toggleFromMenu() {
+        let enabling = !isActive
+        setEnabled(enabling)
+        if enabling, status == .requiresApproval {
+            openSystemLoginItemsSettings()
+        }
+    }
+
+    func makeMenuItem() -> NSMenuItem {
+        refresh()
+        let item = NSMenuItem(
+            title: Self.isSupportedBundle ? "开机自动启动" : "开机自动启动（仅 .app 可用）",
+            action: Self.isSupportedBundle ? #selector(toggleFromMenu) : nil,
+            keyEquivalent: ""
+        )
+        item.target = Self.isSupportedBundle ? self : nil
+        switch status {
+        case .enabled:
+            item.state = .on
+        case .requiresApproval:
+            item.state = .mixed
+        default:
+            item.state = .off
+        }
+        return item
     }
 }

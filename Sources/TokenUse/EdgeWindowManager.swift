@@ -150,6 +150,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     private var isPressingDock = false
     private var isDraggingDock = false
     private var isUpdatingSettingsFromDrag = false
+    private var hasActiveSessions = false
     private var suppressHoverOpenUntil: Date = .distantPast
 
     /// 当设置弹窗 / 登录窗口打开或用户固定面板时，阻止鼠标移出自动收起
@@ -178,6 +179,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         startMouseMonitoring()
         observeScreenChanges()
         observeSettingsChanges()
+        observeSessionActivity()
     }
 
     // MARK: - Screen Resolution Helpers
@@ -489,6 +491,10 @@ final class EdgeWindowManager: NSObject, ObservableObject {
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             triggerView.animator().setFrame(snappedRect, display: true)
+        } completionHandler: { [weak self] in
+            Task { @MainActor in
+                self?.handleMouseMove()
+            }
         }
 
         if isVisible {
@@ -548,6 +554,8 @@ final class EdgeWindowManager: NSObject, ObservableObject {
         }
 
         menu.addItem(.separator())
+        menu.addItem(LaunchAtLoginManager.shared.makeMenuItem())
+
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -580,7 +588,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
 
     private func scheduleShowPanel() {
         cancelHideTimer()
-        guard !isVisible, !isPressingDock, !isDraggingDock else { return }
+        guard !TriggerState.shared.isExpanded, !isPressingDock, !isDraggingDock else { return }
         guard Date() >= suppressHoverOpenUntil else { return }
         guard showTimer == nil else { return }
 
@@ -589,7 +597,8 @@ final class EdgeWindowManager: NSObject, ObservableObject {
                 guard let self else { return }
                 self.showTimer = nil
                 guard !self.isPressingDock, !self.isDraggingDock else { return }
-                self.showPanel()
+                // Hover reveals only the dock; the dashboard requires a click.
+                self.setDockExpanded(true)
             }
         }
     }
@@ -620,10 +629,7 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     func hidePanel() {
         cancelShowTimer()
         guard !isPinned, !isModalPresenting, !isDraggingDock else { return }
-        guard isVisible else {
-            setDockExpanded(false)
-            return
-        }
+        guard isVisible || (TriggerState.shared.isExpanded && !hasActiveSessions) else { return }
         // Keep the original deadline while the pointer continues moving outside.
         guard hideTimer == nil else { return }
         hideTimer = Timer.scheduledTimer(withTimeInterval: hideDelay, repeats: false) { [weak self] _ in
@@ -653,9 +659,10 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     private func performHide() {
-        guard isVisible, !isPinned, !isModalPresenting, !isDraggingDock else { return }
+        guard !isPinned, !isModalPresenting, !isDraggingDock else { return }
+        setDockExpanded(hasActiveSessions || TriggerState.shared.isHovered)
+        guard isVisible else { return }
         isVisible = false
-        setDockExpanded(false)
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.2
@@ -676,6 +683,25 @@ final class EdgeWindowManager: NSObject, ObservableObject {
     }
 
     // MARK: - Screen, Settings & Mouse Monitoring
+
+    private func observeSessionActivity() {
+        SessionActivityMonitor.shared.$activeProviders
+            .map { !$0.isEmpty }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] hasActivity in
+                guard let self else { return }
+                self.hasActiveSessions = hasActivity
+                guard !self.isDraggingDock, !self.isPressingDock else { return }
+                if hasActivity {
+                    self.setDockExpanded(true)
+                } else {
+                    // Recheck the pointer even when it has not moved since activity ended.
+                    self.handleMouseMove()
+                }
+            }
+            .store(in: &cancellables)
+    }
 
     private func observeSettingsChanges() {
         let settings = SettingsManager.shared
@@ -773,6 +799,9 @@ final class EdgeWindowManager: NSObject, ObservableObject {
 
     private func handleMouseMove() {
         guard !isDraggingDock, !isPressingDock else { return }
+        if hasActiveSessions {
+            setDockExpanded(true)
+        }
         let mouseLoc = NSEvent.mouseLocation
         guard let screen = targetScreen() else { return }
         let frame = screen.visibleFrame

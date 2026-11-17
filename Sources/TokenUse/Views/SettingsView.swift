@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -16,6 +17,7 @@ struct SettingsView: View {
     var isStandaloneWindow: Bool = false
 
     @ObservedObject private var settings = SettingsManager.shared
+    @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
     @ObservedObject private var appState = AppState.shared
     @ObservedObject private var resetNotifyService = ResetCreditNotificationService.shared
     @Environment(\.dismiss) private var dismiss
@@ -99,6 +101,7 @@ struct SettingsView: View {
             }
             selectedTab = initialTab
             setupIntervalState()
+            launchAtLogin.refresh()
             appState.reloadAccountList()
             Task {
                 _ = await resetNotifyService.refreshAuthorizationStatus()
@@ -536,6 +539,7 @@ struct SettingsView: View {
     private var generalTabContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                launchAtLoginSection
                 sidebarPositionSection
                 displaySection
                 notificationSection
@@ -546,6 +550,79 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
+        }
+    }
+
+    private var launchAtLoginSection: some View {
+        let statusBadge: (text: String, color: Color)? = {
+            if !LaunchAtLoginManager.isSupportedBundle {
+                return ("仅 .app 模式可用", .orange)
+            }
+            switch launchAtLogin.status {
+            case .enabled:
+                return ("已开启", Color(.sRGB, red: 0.42, green: 0.94, blue: 0.68))
+            case .requiresApproval:
+                return ("待系统批准", .orange)
+            default:
+                return nil
+            }
+        }()
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("开机启动")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+
+                if let statusBadge {
+                    Text(statusBadge.text)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(statusBadge.color)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule()
+                                .fill(statusBadge.color.opacity(0.16))
+                                .overlay(Capsule().stroke(statusBadge.color.opacity(0.38), lineWidth: 0.6))
+                        )
+                }
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Toggle("登录 macOS 时自动启动 TokenUse", isOn: Binding(
+                    get: { launchAtLogin.isActive },
+                    set: { launchAtLogin.setEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(.system(size: 13.5))
+                .foregroundStyle(.white.opacity(0.9))
+                .disabled(!LaunchAtLoginManager.isSupportedBundle)
+
+                Text("开启后将在每次登录系统时自动启动并静默驻留屏幕边缘。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            if launchAtLogin.status == .requiresApproval {
+                Button {
+                    launchAtLogin.openSystemLoginItemsSettings()
+                } label: {
+                    Label("前往系统登录项设置批准", systemImage: "gearshape")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if let errorMessage = launchAtLogin.errorMessage, !errorMessage.isEmpty {
+                Text(errorMessage)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Color.orange.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
