@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import Darwin
 
 // MARK: - ProviderQuotaResult
 
@@ -4723,67 +4724,233 @@ actor ProviderQuotaService {
         let ports: [Int]
     }
 
-    private func discoverAntigravityProcessTargets() -> [AntigravityProcessTarget] {
-        guard let psOutput = runCommandOutput("/bin/ps", arguments: ["-axo", "pid=,command="]) else {
-            return []
+    private struct AntigravityDaemonMetadata {
+        let pid: Int
+        let kindOrder: Int // 0 = app, 1 = cli, 2 = ide
+        let csrfToken: String
+        let httpPort: Int?
+        let httpsPort: Int?
+    }
+
+    private func discoverAntigravityDaemonMetadata() -> [Int: AntigravityDaemonMetadata] {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        var dirCandidates: [(url: URL, kindOrder: Int)] = [
+            (home.appendingPathComponent(".gemini/antigravity/daemon"), 0),
+            (home.appendingPathComponent(".gemini/antigravity-cli/daemon"), 1),
+        ]
+        if let geminiCliHome = ProcessInfo.processInfo.environment["GEMINI_CLI_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !geminiCliHome.isEmpty {
+            let cliDaemonDir = URL(fileURLWithPath: geminiCliHome)
+                .appendingPathComponent("antigravity-cli/daemon")
+            dirCandidates.append((cliDaemonDir, 1))
         }
+        dirCandidates.append((home.appendingPathComponent(".gemini/antigravity-ide/daemon"), 2))
 
-        var targets: [AntigravityProcessTarget] = []
-        for rawLine in psOutput.split(separator: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            let parts = line.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
-            guard parts.count == 2, let pid = Int(parts[0]) else { continue }
-            let cmd = String(parts[1])
-            let lower = cmd.lowercased()
+        var seenDirs = Set<String>()
+        var byPID: [Int: AntigravityDaemonMetadata] = [:]
 
-            let isLS = lower.contains("language_server") || lower.contains("language-server")
-            let isAgyContext = (lower.contains("--app_data_dir") && lower.contains("antigravity"))
-                || lower.contains("/antigravity/")
-                || lower.contains("/antigravity.app/")
-                || lower.contains("antigravity ide.app/")
-            let isHubMode = lower.range(of: #"(?:^|\s)--hub(?:\s|=|$)"#, options: .regularExpression) != nil
-            let isCLI = lower.range(of: #"(?:^|/|\\)(?:antigravity-cli|antigravity_cli)(?:\s|/|\\|$)"#, options: .regularExpression) != nil
-                || (lower.range(of: #"(?:^|/|\\)agy(?:\s|$)"#, options: .regularExpression) != nil && (isLS || isHubMode))
-
-            let kindOrder: Int? = {
-                if isLS && isAgyContext {
-                    let isIDE = lower.contains("antigravity ide.app/")
-                        || lower.contains("--app_data_dir antigravity-ide")
-                        || lower.contains("--app_data_dir=antigravity-ide")
-                        || lower.contains("/extensions/antigravity/bin/language_server")
-                    return isIDE ? 2 : 0
-                }
-                if isCLI { return 1 }
-                return nil
-            }()
-
-            guard let kindOrder else { continue }
-            let csrf = extractFlagValue("--csrf_token", in: cmd)
-            // App / IDE 以及开启 --hub 的 CLI 需要 CSRF Token；普通本机 CLI 无需 CSRF Token
-            if (kindOrder != 1 || isHubMode) && (csrf == nil || csrf!.isEmpty) {
+        for candidate in dirCandidates {
+            let normalizedDir = candidate.url.standardizedFileURL.path
+            guard seenDirs.insert(normalizedDir).inserted else { continue }
+            guard let files = try? fm.contentsOfDirectory(
+                at: candidate.url,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else {
                 continue
             }
 
-            let explicitHubPort = extractFlagValue("--hub-port", in: cmd).flatMap(Int.init)
-            let extPort = extractFlagValue("--extension_server_port", in: cmd).flatMap(Int.init)
-            var discoveredPorts = listeningLocalPorts(forPID: pid)
-            if let extPort, !discoveredPorts.contains(extPort) {
-                discoveredPorts.append(extPort)
-            }
-            if let explicitHubPort {
-                discoveredPorts.removeAll { $0 == explicitHubPort }
-                discoveredPorts.insert(explicitHubPort, at: 0)
-            }
+            let sortedFiles = files
+                .filter { $0.pathExtension.lowercased() == "json" }
+                .map { url -> (url: URL, mtime: Date) in
+                    let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                        ?? Date.distantPast
+                    return (url, mtime)
+                }
+                .sorted { lhs, rhs in
+                    if lhs.mtime != rhs.mtime {
+                        return lhs.mtime > rhs.mtime
+                    }
+                    return lhs.url.lastPathComponent < rhs.url.lastPathComponent
+                }
 
-            if !discoveredPorts.isEmpty {
-                targets.append(AntigravityProcessTarget(
+            for entry in sortedFiles {
+                guard let dict = AccountDiscoveryService.readJSONDictionary(at: entry.url),
+                      let pid = positiveIntValue(dict["pid"]) else {
+                    continue
+                }
+                let rawCSRF = (dict["csrfToken"] as? String) ?? (dict["csrf_token"] as? String)
+                guard let csrf = rawCSRF?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !csrf.isEmpty else {
+                    continue
+                }
+                guard byPID[pid] == nil else { continue }
+
+                let httpPort = validPortValue(dict["httpPort"] ?? dict["http_port"])
+                let httpsPort = validPortValue(dict["httpsPort"] ?? dict["https_port"])
+                byPID[pid] = AntigravityDaemonMetadata(
                     pid: pid,
-                    kindOrder: kindOrder,
-                    csrfToken: csrf ?? "",
-                    ports: discoveredPorts
-                ))
+                    kindOrder: candidate.kindOrder,
+                    csrfToken: csrf,
+                    httpPort: httpPort,
+                    httpsPort: httpsPort
+                )
             }
         }
+        return byPID
+    }
+
+    private func positiveIntValue(_ any: Any?) -> Int? {
+        guard let any, !(any is NSNull), CFGetTypeID(any as AnyObject) != CFBooleanGetTypeID() else {
+            return nil
+        }
+        let parsed: Int?
+        if let v = any as? Int {
+            parsed = v
+        } else if let v = any as? NSNumber {
+            let d = v.doubleValue
+            if d.isFinite, d > 0, d < Double(Int.max), d == d.rounded(.towardZero) {
+                parsed = v.intValue
+            } else {
+                parsed = nil
+            }
+        } else if let s = any as? String {
+            parsed = Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
+        } else {
+            parsed = nil
+        }
+        guard let parsed, parsed > 0 else { return nil }
+        return parsed
+    }
+
+    private func validPortValue(_ any: Any?) -> Int? {
+        guard let port = positiveIntValue(any), (1...65535).contains(port) else {
+            return nil
+        }
+        return port
+    }
+
+    private func appendUniquePort(_ port: Int?, to ports: inout [Int]) {
+        guard let port, (1...65535).contains(port), !ports.contains(port) else { return }
+        ports.append(port)
+    }
+
+    private func isProcessAlive(_ pid: Int) -> Bool {
+        guard pid > 0, let pidT = pid_t(exactly: pid) else { return false }
+        if kill(pidT, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    private func discoverAntigravityProcessTargets() -> [AntigravityProcessTarget] {
+        let daemonByPID = discoverAntigravityDaemonMetadata()
+        let psOutput = runCommandOutput("/bin/ps", arguments: ["-axo", "pid=,command="])
+
+        var psCommandsByPID: [Int: String] = [:]
+        var seenPIDs = Set<Int>()
+        var targets: [AntigravityProcessTarget] = []
+
+        if let psOutput {
+            for rawLine in psOutput.split(separator: "\n") {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                let parts = line.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+                guard parts.count == 2, let pid = Int(parts[0]) else { continue }
+                let cmd = String(parts[1])
+                psCommandsByPID[pid] = cmd
+                let lower = cmd.lowercased()
+
+                let isLS = lower.contains("language_server") || lower.contains("language-server")
+                let isAgyContext = (lower.contains("--app_data_dir") && lower.contains("antigravity"))
+                    || lower.contains("/antigravity/")
+                    || lower.contains("/antigravity.app/")
+                    || lower.contains("antigravity ide.app/")
+                let isHubMode = lower.range(of: #"(?:^|\s)--hub(?:\s|=|$)"#, options: .regularExpression) != nil
+                let isCLI = lower.range(of: #"(?:^|/|\\)(?:antigravity-cli|antigravity_cli)(?:\s|/|\\|$)"#, options: .regularExpression) != nil
+                    || (lower.range(of: #"(?:^|/|\\)agy(?:\s|$)"#, options: .regularExpression) != nil && (isLS || isHubMode))
+
+                let kindOrder: Int? = {
+                    if isLS && isAgyContext {
+                        let isIDE = lower.contains("antigravity ide.app/")
+                            || lower.contains("--app_data_dir antigravity-ide")
+                            || lower.contains("--app_data_dir=antigravity-ide")
+                            || lower.contains("/extensions/antigravity/bin/language_server")
+                        return isIDE ? 2 : 0
+                    }
+                    if isCLI { return 1 }
+                    return nil
+                }()
+
+                guard let kindOrder else { continue }
+                let daemon = daemonByPID[pid]
+                let flagCSRF = extractFlagValue("--csrf_token", in: cmd)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let csrf = (flagCSRF?.isEmpty == false) ? flagCSRF! : (daemon?.csrfToken ?? "")
+                // App / IDE 以及开启 --hub 的 CLI 需要 CSRF Token；普通本机 CLI 无需 CSRF Token
+                if (kindOrder != 1 || isHubMode) && csrf.isEmpty {
+                    continue
+                }
+
+                let explicitHubPort = extractFlagValue("--hub-port", in: cmd).flatMap(Int.init)
+                let extPort = extractFlagValue("--extension_server_port", in: cmd).flatMap(Int.init)
+                var discoveredPorts: [Int] = []
+                appendUniquePort(explicitHubPort, to: &discoveredPorts)
+                appendUniquePort(daemon?.httpPort, to: &discoveredPorts)
+                appendUniquePort(daemon?.httpsPort, to: &discoveredPorts)
+                for port in listeningLocalPorts(forPID: pid) {
+                    appendUniquePort(port, to: &discoveredPorts)
+                }
+                appendUniquePort(extPort, to: &discoveredPorts)
+
+                if !discoveredPorts.isEmpty {
+                    seenPIDs.insert(pid)
+                    targets.append(AntigravityProcessTarget(
+                        pid: pid,
+                        kindOrder: kindOrder,
+                        csrfToken: csrf,
+                        ports: discoveredPorts
+                    ))
+                }
+            }
+        }
+
+        // Daemon 兜底分支：若 ps 不可用或进程命令行未命中上方规则，仍校验进程存活后使用 daemon 元数据
+        let sortedDaemons = daemonByPID.values.sorted {
+            $0.kindOrder == $1.kindOrder ? $0.pid < $1.pid : $0.kindOrder < $1.kindOrder
+        }
+        for daemon in sortedDaemons where !seenPIDs.contains(daemon.pid) {
+            if psOutput != nil {
+                guard let cmd = psCommandsByPID[daemon.pid]?.lowercased() else { continue }
+                let isAntigravityProcess = cmd.contains("antigravity")
+                    || cmd.contains("language_server")
+                    || cmd.contains("language-server")
+                    || cmd.contains("agy")
+                guard isAntigravityProcess else { continue }
+            } else {
+                guard isProcessAlive(daemon.pid) else { continue }
+            }
+
+            var ports: [Int] = []
+            appendUniquePort(daemon.httpPort, to: &ports)
+            appendUniquePort(daemon.httpsPort, to: &ports)
+            if ports.isEmpty {
+                for port in listeningLocalPorts(forPID: daemon.pid) {
+                    appendUniquePort(port, to: &ports)
+                }
+            }
+            guard !ports.isEmpty else { continue }
+
+            seenPIDs.insert(daemon.pid)
+            targets.append(AntigravityProcessTarget(
+                pid: daemon.pid,
+                kindOrder: daemon.kindOrder,
+                csrfToken: daemon.csrfToken,
+                ports: ports
+            ))
+        }
+
         return targets.sorted { $0.kindOrder == $1.kindOrder ? $0.pid < $1.pid : $0.kindOrder < $1.kindOrder }
     }
 
