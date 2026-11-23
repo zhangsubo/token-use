@@ -16,7 +16,14 @@ struct TokenUseApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var shared: AppDelegate?
+
     private var updaterController: SPUStandardUpdaterController?
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
 
     static var isSparkleConfigured: Bool {
         let info = Bundle.main.infoDictionary
@@ -25,7 +32,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return feedURL?.isEmpty == false && publicKey?.isEmpty == false
     }
 
+    private func ensureUpdaterControllerStarted() -> SPUStandardUpdaterController? {
+        guard Self.isSparkleConfigured else { return nil }
+        if let updaterController {
+            return updaterController
+        }
+        let controller = SPUStandardUpdaterController(
+            startingUpdater: false,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+        controller.updater.automaticallyChecksForUpdates = SettingsManager.shared.enableAutoUpdate
+        controller.startUpdater()
+        updaterController = controller
+        return controller
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
         DebugLogger.log("🚀 applicationDidFinishLaunching 开始")
 
         NSApp.setActivationPolicy(.accessory)
@@ -37,15 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ResetCreditNotificationService.shared.setup()
         DebugLogger.log("✅ ResetCreditNotificationService.setup() 完成")
 
-        if SettingsManager.shared.enableAutoUpdate, Self.isSparkleConfigured {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true,
-                updaterDelegate: nil,
-                userDriverDelegate: nil
-            )
-            DebugLogger.log("✅ Sparkle 自动更新已启动")
+        if let controller = ensureUpdaterControllerStarted() {
+            DebugLogger.log("✅ Sparkle 更新器已启动（自动检查：\(controller.updater.automaticallyChecksForUpdates ? "开启" : "关闭")）")
         } else {
-            DebugLogger.log("⚠️ Sparkle 自动更新未启用")
+            DebugLogger.log("⚠️ Sparkle 自动更新未配置")
         }
 
         // 启动数据拉取
@@ -57,8 +76,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DebugLogger.log("🚀 applicationDidFinishLaunching 完成")
     }
 
+    func setAutomaticUpdateChecksEnabled(_ enabled: Bool) {
+        guard let controller = ensureUpdaterControllerStarted() else { return }
+        controller.updater.automaticallyChecksForUpdates = enabled
+    }
+
     /// 暴露给 UI 手动触发更新检查（如设置页"立即检查更新"按钮）
     func checkForUpdates() {
+        NSApp.activate(ignoringOtherApps: true)
+
         guard Self.isSparkleConfigured else {
             let alert = NSAlert()
             alert.messageText = "暂时无法检查更新"
@@ -69,14 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if updaterController == nil {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: false,
-                updaterDelegate: nil,
-                userDriverDelegate: nil
-            )
-        }
+        guard let controller = ensureUpdaterControllerStarted() else { return }
         SettingsManager.shared.lastUpdateCheckDate = Date()
-        updaterController?.updater.checkForUpdates()
+        controller.checkForUpdates(nil)
     }
 }

@@ -1057,7 +1057,7 @@ struct SettingsView: View {
             }
 
             Button {
-                (NSApp.delegate as? AppDelegate)?.checkForUpdates()
+                AppDelegate.shared?.checkForUpdates()
             } label: {
                 Label("立即检查更新", systemImage: "arrow.down.circle")
             }

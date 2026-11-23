@@ -45,7 +45,10 @@ final class SettingsManager: ObservableObject {
     }
 
     @Published var enableAutoUpdate: Bool {
-        didSet { defaults.set(enableAutoUpdate, forKey: Keys.enableAutoUpdate) }
+        didSet {
+            defaults.set(enableAutoUpdate, forKey: Keys.enableAutoUpdate)
+            AppDelegate.shared?.setAutomaticUpdateChecksEnabled(enableAutoUpdate)
+        }
     }
 
     @Published var lastUpdateCheckDate: Date? {

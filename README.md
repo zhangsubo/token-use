@@ -43,7 +43,7 @@ macOS 屏幕边缘毛玻璃组件，支持 **Codex、MiMo Token Plan、Kimi Code
 
 ### 方式一：从 Release 下载（推荐）
 
-[下载最新版本 v1.4.3 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
+[下载最新版本 v1.4.4 (TokenUse.zip)](https://github.com/zhangsubo/token-use/releases/latest) · [查看所有版本](https://github.com/zhangsubo/token-use/releases)
 
 1. 下载 `TokenUse.zip` 并解压得到 `TokenUse.app`
 2. 将 `TokenUse.app` 移动到 `~/Applications/` 或 `/Applications/`
@@ -72,7 +72,7 @@ TOKENUSE_DEBUG=1 swift run
 `build.sh` 支持注入版本号与构建号（CI 自动传入）：
 
 ```bash
-MARKETING_VERSION=1.4.3 BUILD_NUMBER=1 ./build.sh
+MARKETING_VERSION=1.4.4 BUILD_NUMBER=1 ./build.sh
 ```
 
 ## 项目结构
@@ -143,7 +143,7 @@ token-use/
 ## 发布流程
 
 ```bash
-git tag v1.4.3
+git tag v1.4.4
 git push origin main --tags
 ```
 
