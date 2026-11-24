@@ -175,5 +175,16 @@
             length="8182428"
             type="application/octet-stream" />
     </item>
+    <item>
+        <title>TokenUse 1.4.5</title>
+        <sparkle:version>23</sparkle:version>
+        <sparkle:shortVersionString>1.4.5</sparkle:shortVersionString>
+        <pubDate>Tue, 24 Nov 2026 05:15:50 +0000</pubDate>
+        <enclosure
+            url="https://github.com/zhangsubo/token-use/releases/download/v1.4.5/TokenUse.zip"
+            sparkle:edSignature="ra6R2VPmgG1K3ts1LKOv7Nhw25FwBXOyhIlNSN0b+5lSOb4f+xUZZaqOHprD//UYvSM+tyI6hVwthSXhIUz6Bw=="
+            length="8343796"
+            type="application/octet-stream" />
+    </item>
   </channel>
 </rss>
