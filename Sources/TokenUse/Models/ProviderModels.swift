@@ -561,6 +561,48 @@ enum SpeedFormatter {
     }
 }
 
+struct ActivityBucket: Codable, Sendable, Equatable {
+    var tokens: Int = 0
+    var cost: Double = 0.0
+    var requests: Int = 0
+    var byProvider: [String: Int] = [:]
+    var requestsByProvider: [String: Int] = [:]
+
+    mutating func add(provider: TrackedProvider, tokens: Int, cost: Double) {
+        guard tokens > 0 else { return }
+        self.tokens += tokens
+        self.cost += cost
+        self.requests += 1
+        self.byProvider[provider.rawValue, default: 0] += tokens
+        self.requestsByProvider[provider.rawValue, default: 0] += 1
+    }
+
+    func tokens(for provider: TrackedProvider?) -> Int {
+        guard let provider else { return tokens }
+        return byProvider[provider.rawValue] ?? 0
+    }
+
+    func cost(for provider: TrackedProvider?) -> Double {
+        guard let provider else { return cost }
+        guard tokens > 0 else { return 0 }
+        let pTokens = byProvider[provider.rawValue] ?? 0
+        guard pTokens > 0 else { return 0 }
+        return cost * (Double(pTokens) / Double(tokens))
+    }
+
+    func requests(for provider: TrackedProvider?) -> Int {
+        guard let provider else { return requests }
+        return requestsByProvider[provider.rawValue] ?? 0
+    }
+}
+
+struct UsageActivityTimeline: Codable, Sendable, Equatable {
+    var todayStart: Date
+    var todayTenMinuteBuckets: [Int: ActivityBucket]
+    var ninetyDayStart: Date
+    var ninetyDayDailyBuckets: [Int: ActivityBucket]
+}
+
 struct MultiAccountDashboard: Codable, Sendable, Equatable {
     var providers: [ProviderGroupSnapshot]
     var totalTodayTokens: Int
@@ -569,6 +611,7 @@ struct MultiAccountDashboard: Codable, Sendable, Equatable {
     var totalAllTimeCost: Double
     var totalTodayBreakdown: TokenBreakdownSnapshot? = nil
     var totalAllTimeBreakdown: TokenBreakdownSnapshot? = nil
+    var activityTimeline: UsageActivityTimeline? = nil
     var updatedAt: Date
 
     var totalActiveAccounts: Int {

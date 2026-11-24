@@ -23,6 +23,7 @@ struct TokenDashboardContent: View {
     @ObservedObject private var activityMonitor = SessionActivityMonitor.shared
 
     @State private var selectedProvider: TrackedProvider? = nil
+    @State private var activeActivityScope: ActivityChartScope? = nil
     @State private var settingsLaunch: SettingsLaunchConfig? = nil
     @State private var xiaomiLoginAccount: ProviderAccountConfig? = nil
 
@@ -99,6 +100,23 @@ struct TokenDashboardContent: View {
                     summaryStrip(dashboard: dashboard)
                         .padding(.horizontal, 22)
                         .padding(.bottom, 10)
+
+                    if let scope = activeActivityScope {
+                        ActivityHeatmapCard(
+                            scope: scope,
+                            timeline: dashboard.activityTimeline,
+                            selectedProvider: selectedProvider,
+                            showEstimatedCost: settings.showEstimatedCost,
+                            onClose: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                                    activeActivityScope = nil
+                                }
+                            }
+                        )
+                        .padding(.horizontal, 22)
+                        .padding(.bottom, 10)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
 
                     providerFilterBar(dashboard: dashboard)
                         .padding(.horizontal, 22)
@@ -332,8 +350,13 @@ struct TokenDashboardContent: View {
                 accent: Color(.sRGB, red: 0.38, green: 0.76, blue: 1.0),
                 tokensText: NumberFormatterUtil.format(dashboard.totalTodayTokens),
                 costText: settings.showEstimatedCost ? NumberFormatterUtil.formatCurrency(dashboard.totalTodayCost) : nil,
-                breakdown: dashboard.totalTodayBreakdown
-            )
+                breakdown: dashboard.totalTodayBreakdown,
+                isSelected: activeActivityScope == .today
+            ) {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                    activeActivityScope = (activeActivityScope == .today) ? nil : .today
+                }
+            }
 
             CompactMetricCard(
                 title: "近 90 天累计 (90d)",
@@ -341,8 +364,13 @@ struct TokenDashboardContent: View {
                 accent: Color(.sRGB, red: 0.56, green: 0.88, blue: 0.68),
                 tokensText: NumberFormatterUtil.format(dashboard.totalAllTimeTokens),
                 costText: settings.showEstimatedCost ? NumberFormatterUtil.formatCurrency(dashboard.totalAllTimeCost) : nil,
-                breakdown: dashboard.totalAllTimeBreakdown
-            )
+                breakdown: dashboard.totalAllTimeBreakdown,
+                isSelected: activeActivityScope == .ninetyDays
+            ) {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                    activeActivityScope = (activeActivityScope == .ninetyDays) ? nil : .ninetyDays
+                }
+            }
 
             WorkingMascotBadgeView()
                 .frame(width: 68, height: 68)
@@ -461,73 +489,94 @@ private struct CompactMetricCard: View {
     let tokensText: String
     let costText: String?
     let breakdown: TokenBreakdownSnapshot?
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(accent)
-                Text(title)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.68))
-                Spacer(minLength: 0)
-                if let costText {
-                    Text(costText)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(Color(.sRGB, red: 0.16, green: 0.56, blue: 0.38).opacity(0.32))
-                                .overlay(
-                                    Capsule()
-                                        .stroke(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68).opacity(0.28), lineWidth: 0.6)
-                                )
-                        )
-                        .help("按 API 单价折算等效价值")
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(accent)
+                    Text(title)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.68))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(isSelected ? accent : .white.opacity(isHovered ? 0.65 : 0.38))
+                        .rotationEffect(.degrees(isSelected ? 180 : 0))
+                    Spacer(minLength: 0)
+                    if let costText {
+                        Text(costText)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule()
+                                    .fill(Color(.sRGB, red: 0.16, green: 0.56, blue: 0.38).opacity(0.32))
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(Color(.sRGB, red: 0.44, green: 0.94, blue: 0.68).opacity(0.28), lineWidth: 0.6)
+                                    )
+                            )
+                            .help("按 API 单价折算等效价值")
+                    }
                 }
-            }
 
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(tokensText)
-                    .font(.system(size: 19, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-
-                Text("Tokens")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.46))
-
-                Spacer(minLength: 0)
-
-                if let b = breakdown, b.totalTokens > 0 {
-                    Text(String(format: "缓存 %.0f%%", b.cacheHitPercent))
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.55))
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(tokensText)
+                        .font(.system(size: 19, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+
+                    Text("Tokens")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.46))
+
+                    Spacer(minLength: 0)
+
+                    if let b = breakdown, b.totalTokens > 0 {
+                        Text(String(format: "缓存 %.0f%%", b.cacheHitPercent))
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.55))
+                            .lineLimit(1)
+                    }
                 }
             }
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 9)
-        .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [.white.opacity(0.11), .white.opacity(0.05)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
+            .padding(.horizontal, 13)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: isSelected
+                                ? [accent.opacity(0.20), .white.opacity(0.08)]
+                                : (isHovered
+                                    ? [.white.opacity(0.15), .white.opacity(0.07)]
+                                    : [.white.opacity(0.11), .white.opacity(0.05)]),
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 15, style: .continuous)
-                        .stroke(.white.opacity(0.16), lineWidth: 0.8)
-                )
-        )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .stroke(
+                                isSelected ? accent.opacity(0.72) : .white.opacity(isHovered ? 0.28 : 0.16),
+                                lineWidth: isSelected ? 1.2 : 0.8
+                            )
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help(isSelected ? "点击收起活动图" : "点击查看 Token 活动图")
     }
 }
 

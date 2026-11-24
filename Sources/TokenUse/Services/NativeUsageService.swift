@@ -14,6 +14,7 @@ struct CombinedLocalUsageResult: Sendable {
     let perProviderAllTime: [TrackedProvider: UsageTotals]
     let perProviderToday: [TrackedProvider: UsageTotals]
     let offlineCodexSnapshots: [String: OfflineCodexRateLimit]
+    let activityTimeline: UsageActivityTimeline
 }
 
 struct SpeedSampleAccumulator: Sendable, Codable, Equatable {
@@ -140,12 +141,26 @@ actor NativeUsageService {
         dynamicAntigravityModels: [Int: String]
     ) async -> CombinedLocalUsageResult {
         let now = Date()
-        let allTimeInterval = DateInterval(start: now.addingTimeInterval(-86_400 * 90), end: now.addingTimeInterval(3600))
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: now)
+        let ninetyDayStart = calendar.date(byAdding: .day, value: -89, to: todayStart)
+            ?? todayStart.addingTimeInterval(-86_400 * 89)
+        let dayStartTimestamps: [TimeInterval] = (0...90).map { offset in
+            (calendar.date(byAdding: .day, value: offset, to: ninetyDayStart)
+                ?? ninetyDayStart.addingTimeInterval(Double(offset) * 86_400))
+            .timeIntervalSince1970
+        }
+        let allTimeStart = min(now.addingTimeInterval(-86_400 * 90), ninetyDayStart)
+        let allTimeInterval = DateInterval(start: allTimeStart, end: now.addingTimeInterval(3600))
         let todayInterval = Self.localDayInterval(for: now)
 
         var state = DualScanState(
             allTimeInterval: allTimeInterval,
             todayInterval: todayInterval,
+            todayStart: todayStart,
+            ninetyDayStart: ninetyDayStart,
+            dayStartTimestamps: dayStartTimestamps,
+            calendar: calendar,
             accounts: accounts
         )
 
@@ -157,6 +172,13 @@ actor NativeUsageService {
         scanClaudeRoutedModels(state: &state)
         scanAntigravity(state: &state, dynamicModels: dynamicAntigravityModels)
 
+        let timeline = UsageActivityTimeline(
+            todayStart: todayStart,
+            todayTenMinuteBuckets: state.todayTenMinuteBuckets,
+            ninetyDayStart: ninetyDayStart,
+            ninetyDayDailyBuckets: state.ninetyDayDailyBuckets
+        )
+
         return CombinedLocalUsageResult(
             allTimeReport: state.allTimeAccumulator.report(),
             todayReport: state.todayAccumulator.report(),
@@ -164,7 +186,8 @@ actor NativeUsageService {
             perAccountToday: state.perAccountToday,
             perProviderAllTime: state.perProviderAllTime,
             perProviderToday: state.perProviderToday,
-            offlineCodexSnapshots: state.offlineCodexSnapshots
+            offlineCodexSnapshots: state.offlineCodexSnapshots,
+            activityTimeline: timeline
         )
     }
 
@@ -1530,6 +1553,10 @@ actor NativeUsageService {
 private struct DualScanState {
     let allTimeInterval: DateInterval
     let todayInterval: DateInterval
+    let todayStart: Date
+    let ninetyDayStart: Date
+    let dayStartTimestamps: [TimeInterval]
+    let calendar: Calendar
     let accounts: [ProviderAccountConfig]
 
     var allTimeAccumulator = UsageAccumulator()
@@ -1540,6 +1567,32 @@ private struct DualScanState {
     var perProviderAllTime: [TrackedProvider: UsageTotals] = [:]
     var perProviderToday: [TrackedProvider: UsageTotals] = [:]
     var offlineCodexSnapshots: [String: OfflineCodexRateLimit] = [:]
+    var todayTenMinuteBuckets: [Int: ActivityBucket] = [:]
+    var ninetyDayDailyBuckets: [Int: ActivityBucket] = [:]
+
+    private func ninetyDayIndex(for timestamp: Date) -> Int? {
+        guard dayStartTimestamps.count == 91 else { return nil }
+        let ts = timestamp.timeIntervalSince1970
+        let first = dayStartTimestamps[0]
+        let end = dayStartTimestamps[90]
+        guard ts >= first && ts < end else { return nil }
+
+        var idx = min(89, max(0, Int((ts - first) / 86_400)))
+        while idx < 89 && ts >= dayStartTimestamps[idx + 1] {
+            idx += 1
+        }
+        while idx > 0 && ts < dayStartTimestamps[idx] {
+            idx -= 1
+        }
+        return idx
+    }
+
+    private func todayTenMinuteSlot(for timestamp: Date) -> Int {
+        let comps = calendar.dateComponents([.hour, .minute], from: timestamp)
+        let hour = comps.hour ?? 0
+        let minute = comps.minute ?? 0
+        return min(143, max(0, hour * 6 + minute / 10))
+    }
 
     func primaryAccountId(for provider: TrackedProvider) -> String? {
         accounts.first { $0.provider == provider && $0.isEnabled }?.id
@@ -1586,6 +1639,14 @@ private struct DualScanState {
 
         let isToday = todayInterval.contains(timestamp)
 
+        if let dayIdx = ninetyDayIndex(for: timestamp) {
+            ninetyDayDailyBuckets[dayIdx, default: ActivityBucket()].add(
+                provider: tracked,
+                tokens: total,
+                cost: cost
+            )
+        }
+
         allTimeAccumulator.add(
             client: client,
             provider: tracked.rawValue,
@@ -1623,6 +1684,12 @@ private struct DualScanState {
         }
 
         if isToday {
+            let slot = todayTenMinuteSlot(for: timestamp)
+            todayTenMinuteBuckets[slot, default: ActivityBucket()].add(
+                provider: tracked,
+                tokens: total,
+                cost: cost
+            )
             todayAccumulator.add(
                 client: client,
                 provider: tracked.rawValue,

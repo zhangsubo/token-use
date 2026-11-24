@@ -533,6 +533,7 @@ final class AppState: ObservableObject {
             totalAllTimeCost: totalAllTimeCost,
             totalTodayBreakdown: totalTodayTokens > 0 ? grandTodayBreakdown : nil,
             totalAllTimeBreakdown: totalAllTimeTokens > 0 ? grandAllTimeBreakdown : nil,
+            activityTimeline: localUsage.activityTimeline,
             updatedAt: updatedAt
         )
     }
